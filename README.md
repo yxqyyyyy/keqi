@@ -87,7 +87,7 @@ iPhone、iPad、Mac 通过 iCloud 日历接收提醒；手机和平板可安装�
 
 ## iPhone 原生两小时前闹钟（待真机验证）
 
-`ios/KeqiAlarm.xcodeproj` 是 iOS 26+ AlarmKit 配套 App 工程，按 DDL−2 小时的绝对日期安排系统闹钟。需要完整 Xcode、本人签名和手机端日历/闹钟授权；当前仅通过源码检查和 Foundation 核心验证，**尚未完成 iOS SDK 编译、安装或真机响铃测试**。现有日历通知保留。安装步骤及后台取消限制见 [iPhone 工程说明](ios/README.md)。
+`ios/KeqiAlarm.xcodeproj` 是 iOS 26+ AlarmKit 配套 App 工程，按 DDL−2 小时的绝对日期安排系统闹钟。已通过云端 Xcode 26.3 的 iPhone SDK 未签名编译及 24 个 XCTest，**尚未完成本人签名、手机安装或真机响铃测试**。安装需要完整 Xcode、本人签名和手机端日历/闹钟授权，现有日历通知保留。安装步骤及后台取消限制见 [iPhone 工程说明](ios/README.md)。
 
 ## 安装登录自启服务
 

@@ -36,6 +36,8 @@ jobs:
             -derivedDataPath build/iphone-derived CODE_SIGNING_ALLOWED=NO build
       - name: Verify existing app and widget
         run: |
-          python3 -W error::ResourceWarning -m unittest discover -s tests -q
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -W error::ResourceWarning -m unittest discover -s tests -q
           node tests/test_widget.js
           TZ=America/Los_Angeles node tests/test_widget.js

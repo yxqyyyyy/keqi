@@ -2,7 +2,7 @@
 
 这是 **iOS 26 或更新版本**的配套 App 源码。使用 AlarmKit 系统闹钟，在课期任务截止前两小时响铃。它读取本机已同步的 iCloud“作业与考试”日历，不接收平台密码，不改写日历，也不把手机数据发回 Mac。
 
-**目前是待真机验收的工程，尚无可直接安装的 IPA 或 TestFlight。**当前开发机只有 Command Line Tools，没有完整 Xcode 或 iPhone SDK。Swift 语法、工程 plist 和 Foundation 核心逻辑已检查；这些不能代替 iOS SDK 编译与真机响铃测试。
+**目前是待真机验收的工程，尚无可直接安装的 IPA 或 TestFlight。**当前 Mac 没有完整 Xcode，但已在 GitHub 的 Xcode 26.3 环境中使用 iPhone SDK 完成未签名编译，24 个 XCTest 和 43 项 Foundation 核心检查通过。尚未进行本人签名、手机安装或实际响铃测试。
 
 ## 安装前准备
 
@@ -17,7 +17,7 @@ Xcode Personal Team 可供本人测试安装，但免费签名存在时效：App
 
 1. 打开 `ios/KeqiAlarm.xcodeproj`，选择 **KeqiAlarm** target。
 2. 在 **Signing & Capabilities** 中选择自己的 Team，保留自动签名。如果默认 Bundle Identifier 被占用，改成自己的唯一标识；不要把 Apple ID、证书或配置文件提交到 GitHub。
-3. 运行设备选择连接的 iPhone，点击 Run。首次编译需根据实际 SDK 的诊断修复兼容问题；当前还没有运行过这一步。
+3. 运行设备选择连接的 iPhone，点击 Run。云端未签名构建已通过，但这一步的本人签名与手机部署仍需在本机完成。
 4. 手机打开“课期闹钟”，点击 **授权并开启 2 小时闹钟**，本人允许完整日历访问和闹钟权限。存在多个同名 iCloud 日历时，先明确选择一个再同步。
 5. 先点击 **设一个 1 分钟测试闹钟**，锁屏确认实际响铃和停止行为。测试只由本人点击创建，不会自动开始，也不会把作业标为完成。
 6. 核对清单里每个任务的响铃时刻确为 DDL−2 小时，再用一条实际任务验证更新与取消。
@@ -41,7 +41,7 @@ cd ios/AlarmCore
 swift run --scratch-path .build keqi-core-check
 ```
 
-Foundation 验证器实际编译运行，43 项检查通过，覆盖专用日历标识、严格日期、跨日、时区、两小时边界和冲突拒绝。另保留 24 个 XCTest 方法；此机 CLT 不提供 XCTest，尚未执行 `swift test`。
+Foundation 验证器实际编译运行，43 项检查通过，覆盖专用日历标识、严格日期、跨日、时区、两小时边界和冲突拒绝。本机 CLT 不提供 XCTest；GitHub 的完整 Xcode 环境已执行 24 个 XCTest，全部通过。
 
 安装完整 Xcode 后还需要执行：
 
@@ -52,4 +52,4 @@ xcodebuild -project ios/KeqiAlarm.xcodeproj -scheme KeqiAlarm \
   -derivedDataPath build/iphone-derived CODE_SIGNING_ALLOWED=NO build
 ```
 
-编译成功后仍须按上面的步骤完成本人签名与真机验收。测试记录应分别注明源码检查、SDK 编译和真机结果。
+云端已执行同样的未签名构建。编译成功后仍须按上面的步骤完成本人签名与真机验收。[构建记录](https://github.com/yxqyyyyy/keqi/actions/workflows/verify-iphone.yml)与测试记录分别说明源码检查、SDK 编译和真机结果。
