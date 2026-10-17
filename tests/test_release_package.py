@@ -145,6 +145,32 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertNotIn(personal, error.getvalue())
         self.assertIn("README.md:1", error.getvalue())
 
+    def test_iphone_sources_allow_only_engineering_files_and_exclude_local_state(self):
+        allowed = ["ios/README.md", "ios/KeqiAlarm/Info.plist", "ios/KeqiAlarm/ContentView.swift",
+                   "ios/KeqiAlarm.xcodeproj/project.pbxproj",
+                   "ios/KeqiAlarm.xcodeproj/xcshareddata/xcschemes/KeqiAlarm.xcscheme",
+                   "ios/AlarmCore/Package.swift", "ios/AlarmCore/Sources/KeqiAlarmCore/Models.swift",
+                   "ios/AlarmCore/Sources/AlarmCoreChecks/main.swift",
+                   "ios/AlarmCore/Tests/KeqiAlarmCoreTests/PlannerTests.swift"]
+        excluded = ["ios/AlarmCore/.build/cache.swift", "ios/AlarmCore/.swiftpm/configuration.json",
+                    "ios/KeqiAlarm/managed-alarms.json", "ios/KeqiAlarm/secret.swift",
+                    "ios/KeqiAlarm.xcodeproj/xcuserdata/name.xcuserdatad/UserInterfaceState.xcuserstate",
+                    "ios/Personal.swift", "ios/private/backup.swift"]
+        for name in allowed + excluded:
+            self.write(name, "fixture\n")
+        sources = release.collect_sources(self.root)
+        self.assertTrue(set(allowed).issubset(sources))
+        self.assertTrue(set(excluded).isdisjoint(sources))
+
+    def test_iphone_nested_parent_symlink_is_rejected(self):
+        private = self.root / "private-source"
+        private.mkdir()
+        (private / "Package.swift").write_text("must not open\n")
+        (self.root / "ios").mkdir()
+        (self.root / "ios" / "AlarmCore").symlink_to(private, target_is_directory=True)
+        with self.assertRaisesRegex(release.ReleaseError, "符号链接"):
+            release.collect_sources(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

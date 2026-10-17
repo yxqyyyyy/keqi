@@ -15,7 +15,15 @@
       <p class="eyebrow">课期 · 主屏幕</p>
       <h1>下一次截止，抬眼就能看见。</h1>
       <p>通过 Scriptable，在 iPhone 和 iPad 上显示作业名称、截止时间和剩余天数。数据来自设备已同步的“作业与考试”日历。</p>
+      <p><strong>24 小时内待交变橙色，2 小时内变红色并提示“尽快提交”。</strong>考试显示“待考”，线下作业显示“线下待交”。</p>
     </header>
+    <section class="urgency-preview" aria-label="紧急作业外观示意">
+      <p class="preview-caption">外观示意 · 以下任务仅用于展示，不是你的实际作业</p>
+      <div class="preview-widgets">
+        <div class="preview-widget soon"><div class="preview-heading"><strong>课期</strong><b>24h 待交 1</b></div><span>课程 · 待交</span><strong class="preview-title">课后习题</strong><strong class="preview-countdown">剩 18 小时</strong><span>今天 23:59 截止</span><small>以已同步日历为准</small></div>
+        <div class="preview-widget critical"><div class="preview-heading"><strong>课期</strong><b>24h 待交 1</b></div><span>课程 · 尽快提交</span><strong class="preview-title">章节作业</strong><strong class="preview-countdown">剩 42 分钟</strong><span>今天 18:00 截止</span><small>以已同步日历为准</small></div>
+      </div>
+    </section>
     <section class="sizes" aria-label="小组件尺寸">
       <div><strong>小号</strong><span>最近一项 · 大倒计时</span></div>
       <div><strong>中号</strong><span>三项近期安排</span></div>
@@ -28,7 +36,7 @@
       </article>
       <article>
         <span class="step-number" aria-hidden="true">2</span>
-        <div><h2>复制脚本，运行一次</h2><p>复制下方脚本。在 Scriptable 中点击“＋”，粘贴代码，将名称改为“课期”，然后点击运行，允许读取日历。首次会预览中号清单。</p><div class="actions"><button class="button primary" id="copyScript" type="button" disabled>正在载入脚本…</button><a class="button secondary" href="/widgets/keqi-widget.js" download="课期.js">下载脚本文件</a></div><p class="status" id="copyStatus" role="status" aria-live="polite"></p><details id="sourceDetails"><summary>查看脚本内容</summary><textarea id="scriptSource" readonly spellcheck="false" aria-label="课期 Scriptable 脚本"></textarea></details></div>
+        <div><h2>复制脚本，运行一次</h2><p>首次安装：在 Scriptable 中新建“课期”，粘贴完整代码并运行、授权日历。已经安装旧版：打开原“课期”脚本，用下方完整代码替换后运行一次；原主屏幕组件可继续使用。手机上的旧脚本不会因 Mac 程序更新而自动升级。</p><div class="actions"><button class="button primary" id="copyScript" type="button" disabled>正在载入脚本…</button><a class="button secondary" href="/widgets/keqi-widget.js" download="课期.js">下载脚本文件</a></div><p class="status" id="copyStatus" role="status" aria-live="polite"></p><details id="sourceDetails"><summary>查看脚本内容</summary><textarea id="scriptSource" readonly spellcheck="false" aria-label="课期 Scriptable 脚本"></textarea></details></div>
       </article>
       <article>
         <span class="step-number" aria-hidden="true">3</span>
@@ -41,7 +49,9 @@
         <li>手机读取本地日历，不必与 Mac 连接同一 Wi-Fi。Mac 仍负责每天读取平台。</li>
         <li>所有日期和时间按北京时间显示。未来安排优先，过去 30 天的逾期记录另行提示；查询未来 60 天。</li>
         <li>小组件刷新由系统安排；页面和脚本中“读取时间”表示读取设备日历的时间，不代表平台刚刚同步。</li>
+        <li>颜色和待交计数以设备已同步的日历为准，不直接查询平台。提交后需等 Mac 核对、iCloud 更新，再等组件刷新。</li>
         <li>提前 48／24／2 小时的提醒继续由 Apple 日历负责。脚本不会修改日历、创建通知或向 Mac 回传操作。</li>
+        <li>真正的 iPhone 2 小时闹钟需要单独安装 iOS 26+ 配套 App；小组件更新本身不会创建闹钟。配套工程仍待 Xcode 编译和真机验收。</li>
         <li>当前已完成脚本和模拟验证，iPhone／iPad 上的真实显示及日历权限仍需安装后确认。</li>
       </ul>
       <p class="references"><a href="https://docs.scriptable.app/calendarevent/" target="_blank" rel="noopener noreferrer">日历接口文档 ↗</a><a href="https://docs.scriptable.app/listwidget/" target="_blank" rel="noopener noreferrer">小组件与刷新说明 ↗</a></p>
