@@ -1,0 +1,2 @@
+# Optional: platform login and read-only browser collection. Core UI uses stdlib.
+playwright>=1.48,<2

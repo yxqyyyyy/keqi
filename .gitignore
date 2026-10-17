@@ -1,0 +1,44 @@
+# 本机任务、平台会话和配对码
+/data/*
+!/data/.gitkeep
+/exports/
+/backups/
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+
+# 本机构建、依赖和发布产物
+/build/
+/dist/
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+/node_modules/
+
+# 凭据与本地配置；只有明确不含凭据的示例允许提交
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.ssh/
+
+# 运行日志与系统文件
+*.log
+/logs/
+.DS_Store
+.AppleDouble
+._*

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>local.studydeadline.CalendarBridge</string>
+  <key>CFBundleName</key>
+  <string>作业提醒日历桥接</string>
+  <key>CFBundleDisplayName</key>
+  <string>作业提醒日历桥接</string>
+  <key>CFBundleExecutable</key>
+  <string>CalendarBridge</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSCalendarsUsageDescription</key>
+  <string>将你确认的作业与考试截止时间同步到 iCloud 的专用日历，并设置提前 48 小时、24 小时和 2 小时提醒。</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>在 iCloud 的“作业与考试”日历中创建和更新本程序的截止时间事件，并清理已完成或删除的任务；不会更改其他事件。</string>
+</dict>
+</plist>
