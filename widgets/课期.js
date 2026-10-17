@@ -17,6 +17,19 @@ const palette = {
   urgent: Color.dynamic(new Color("9B583D"), new Color("EAB599")),
   line: Color.dynamic(new Color("DDE5DA"), new Color("35443A")),
 };
+// 暖橙代表 24 小时内，红色代表 2 小时内。颜色和文字同时提示，避免仅靠颜色区分。
+const urgencyPalette = {
+  soon: {
+    background: Color.dynamic(new Color("FFE2BA"), new Color("583218")),
+    ink: Color.dynamic(new Color("44260D"), new Color("FFF0DA")),
+    secondary: Color.dynamic(new Color("704418"), new Color("F3CEA7")),
+    accent: Color.dynamic(new Color("913800"), new Color("FFD6A0")),
+  },
+  critical: {
+    background: Color.dynamic(new Color("AB242C"), new Color("92252D")),
+    ink: new Color("FFFFFF"), secondary: new Color("FFE8E0"), accent: new Color("FFFFFF"),
+  },
+};
 
 function options() {
   const parameter = typeof args.widgetParameter === "string" ? args.widgetParameter.trim() : "";
@@ -144,7 +157,20 @@ async function readTasks(calendarId) {
   tasks.forEach(task => unique.set(task.id, task));
   return Array.from(unique.values());
 }
+function urgency(task) {
+  const left = task.due.getTime() - now.getTime();
+  if (task.overdue || left < 0 || left > 24 * 3600000) return 0;
+  return left <= 2 * 3600000 ? 2 : 1;
+}
+function taskColors(task) {
+  const level = urgency(task);
+  return level ? urgencyPalette[level === 2 ? "critical" : "soon"] : palette;
+}
+function pendingLabel(task) {
+  return task.kind === "exam" ? "待考" : task.offline ? "线下待交" : "待交";
+}
 function remaining(task) {
+  if (task.due.getTime() === now.getTime()) return "现在截止";
   const ms = Math.abs(task.due.getTime() - now.getTime());
   let label;
   if (ms < 3600000) label = `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
@@ -175,51 +201,75 @@ function text(container, value, size, color = palette.ink, bold = false, lines =
   element.minimumScaleFactor = 0.85;
   return element;
 }
-function header(widget, family, futureCount, overdueCount) {
+function header(widget, family, future, overdueCount, smallColors) {
   const row = widget.addStack();
   row.centerAlignContent();
-  text(row, "课期", family === "small" ? 15 : 16, palette.green, true);
+  text(row, "课期", family === "small" ? 15 : 16, smallColors ? smallColors.ink : palette.green, true);
   row.addSpacer();
-  const summary = family === "small" ? "北京时间" : futureCount === 0 && overdueCount > 0 ?
-    `未来暂无 · 逾期 ${overdueCount}` : `待办 ${futureCount}${overdueCount ? ` · 逾期 ${overdueCount}` : ""}`;
+  const soon = future.filter(task => urgency(task));
+  const dueAssignments = soon.filter(task => task.kind === "assignment").length;
+  const dueExams = soon.length - dueAssignments;
+  if (soon.length) {
+    const badge = row.addStack();
+    const colors = smallColors || urgencyPalette[soon.some(task => urgency(task) === 2) ? "critical" : "soon"];
+    badge.backgroundColor = colors.background;
+    badge.cornerRadius = 5;
+    badge.setPadding(2, 5, 2, 5);
+    const counts = `${dueAssignments ? `待交 ${dueAssignments}` : ""}${dueAssignments && dueExams ? " · " : ""}${dueExams ? `待考 ${dueExams}` : ""}`;
+    text(badge, `24h ${counts}`, family === "small" ? 10 : 12, colors.ink, true);
+    return;
+  }
+  const summary = family === "small" ? "北京时间" : future.length === 0 && overdueCount > 0 ?
+    `未来暂无 · 逾期 ${overdueCount}` : `待办 ${future.length}${overdueCount ? ` · 逾期 ${overdueCount}` : ""}`;
   text(row, summary, 10, overdueCount ? palette.urgent : palette.secondary);
 }
 function compactRow(container, task, family) {
   const row = container.addStack();
   row.layoutVertically();
+  const level = urgency(task);
+  const colors = taskColors(task);
+  // 每项保持两行；紧急卡只增加 2pt 高度，中号仍可显示 3 项。
+  if (level) {
+    row.backgroundColor = colors.background;
+    row.cornerRadius = 6;
+    row.setPadding(1, 5, 1, 5);
+  }
   const top = row.addStack();
-  const color = task.overdue ? palette.urgent : palette.green;
-  const kind = task.kind === "exam" ? "考试 · " : "";
-  text(top, `${task.course} · ${kind}${task.title}`, 12, palette.ink, true);
+  const kind = level || task.kind === "exam" ? `${pendingLabel(task)} · ` : "";
+  text(top, `${task.course} · ${kind}${task.title}`, 12, colors.ink, true);
   top.addSpacer(4);
-  text(top, remaining(task), 10, color);
+  text(top, remaining(task), level ? 12 : 10, level ? colors.accent : task.overdue ? palette.urgent : palette.green, Boolean(level));
   row.addSpacer(2);
-  const second = `${deadline(task)}${task.start ? " · " + examStart(task, true) : ""}`;
-  text(row, second, 10, palette.secondary);
+  const cue = level === 2 && task.kind === "assignment" ? "尽快提交 · " : "";
+  const second = `${cue}${deadline(task)}${task.start ? " · " + examStart(task, true) : ""}`;
+  text(row, second, 10, colors.secondary);
   if (family !== "medium") {
     const note = midnightNote(task);
-    if (note) { row.addSpacer(1); text(row, note, 9, palette.secondary); }
+    if (note) { row.addSpacer(1); text(row, note, 9, colors.secondary); }
   }
 }
 function smallBody(widget, task, overdueCount) {
-  widget.addSpacer(5);
-  text(widget, `${task.course}${task.kind === "exam" ? " · 考试" : ""}`, 10, palette.secondary, true);
-  widget.addSpacer(2);
-  text(widget, task.title, 14, palette.ink, true, 2);
+  const level = urgency(task);
+  const colors = taskColors(task);
   widget.addSpacer(4);
-  text(widget, remaining(task), 19, task.overdue ? palette.urgent : palette.green, true);
+  const label = level === 2 && task.kind === "assignment" ? "尽快提交" : pendingLabel(task);
+  text(widget, `${task.course} · ${label}`, 10, colors.secondary, true);
   widget.addSpacer(2);
-  text(widget, dateText(task.due, beijingParts(task.due).year !== beijingParts(now).year) + " 截止", 10, palette.secondary);
+  text(widget, task.title, 14, colors.ink, true, 2);
+  widget.addSpacer(3);
+  text(widget, remaining(task), level ? 22 : 19, level ? colors.accent : task.overdue ? palette.urgent : palette.green, true);
+  widget.addSpacer(2);
+  text(widget, dateText(task.due, beijingParts(task.due).year !== beijingParts(now).year) + " 截止", 10, colors.secondary);
   if (task.start) {
     widget.addSpacer(2);
-    text(widget, examStart(task, false), 9, palette.secondary);
+    text(widget, examStart(task, false), 9, colors.secondary);
   } else if (midnightNote(task)) {
     widget.addSpacer(2);
-    text(widget, midnightNote(task), 9, palette.secondary);
+    text(widget, midnightNote(task), 9, colors.secondary);
   }
   widget.addSpacer();
-  if (overdueCount && !task.overdue) text(widget, `另有 ${overdueCount} 项逾期`, 9, palette.urgent);
-  else text(widget, `读取 ${timeText(now)}`, 9, palette.secondary);
+  const suffix = overdueCount && !task.overdue ? ` · 逾期 ${overdueCount}` : "";
+  text(widget, `以已同步日历为准${suffix}`, 8, colors.secondary);
 }
 function message(widget, title, body, family) {
   widget.addSpacer();
@@ -231,7 +281,7 @@ function message(widget, title, body, family) {
 function makeWidget(tasks, family, error, calendarId) {
   const widget = new ListWidget();
   widget.backgroundColor = palette.background;
-  widget.setPadding(family === "small" ? 10 : 14, 14, family === "small" ? 8 : 12, 14);
+  widget.setPadding(family === "large" || family === "extraLarge" ? 14 : 10, 14, family === "large" || family === "extraLarge" ? 12 : 8, 14);
   widget.refreshAfterDate = new Date(now.getTime() + 15 * 60000);
   // Scriptable 官方 URL：点击打开脚本预览，不修改日历，也不访问本地 Mac 服务。
   const runURL = URLScheme.forRunningScript();
@@ -239,7 +289,9 @@ function makeWidget(tasks, family, error, calendarId) {
     (calendarId ? `&calendarId=${encodeURIComponent(calendarId)}` : "");
   const future = tasks.filter(task => !task.overdue).sort((a, b) => a.due - b.due);
   const past = tasks.filter(task => task.overdue).sort((a, b) => b.due - a.due);
-  header(widget, family, future.length, past.length);
+  const smallColors = !error && family === "small" && future.length && urgency(future[0]) ? taskColors(future[0]) : null;
+  if (smallColors) widget.backgroundColor = smallColors.background;
+  header(widget, family, error ? [] : future, error ? 0 : past.length, smallColors);
   if (error) { message(widget, "需要检查日历", error, family); return widget; }
   if (!tasks.length) {
     message(widget, "近期没有课期待办", "查询范围：过去 30 天至未来 60 天。以本机已收到的日历记录为准。", family);
@@ -251,7 +303,7 @@ function makeWidget(tasks, family, error, calendarId) {
     visible = visible.concat(past.slice(0, capacity - visible.length));
   }
   if (family === "small") { smallBody(widget, visible[0], past.length); return widget; }
-  widget.addSpacer(family === "medium" ? 7 : 12);
+  widget.addSpacer(family === "medium" ? 5 : 12);
   if (!future.length && family !== "medium") {
     text(widget, "未来 60 天暂无待办 · 以下为逾期记录", 10, palette.urgent);
     widget.addSpacer(5);
@@ -270,14 +322,14 @@ function makeWidget(tasks, family, error, calendarId) {
   } else {
     visible.forEach((task, index) => {
       compactRow(widget, task, family);
-      if (index < visible.length - 1) widget.addSpacer(family === "medium" ? 6 : 10);
+      if (index < visible.length - 1) widget.addSpacer(family === "medium" ? 4 : 10);
     });
   }
   widget.addSpacer();
   const remainingCount = Math.max(0, future.length + past.length - visible.length);
   const footer = family === "medium" ?
-    `北京时间 · 读取 ${timeText(now)}${remainingCount ? ` · 另 ${remainingCount} 项` : ""}` :
-    `北京时间 · 读取 ${dateText(now)} · 逾期统计近 30 天${remainingCount ? ` · 另 ${remainingCount} 项` : ""}`;
+    `以已同步日历为准 · ${timeText(now)}${remainingCount ? ` · 另 ${remainingCount} 项` : ""}` :
+    `以已同步日历为准 · 北京时间 ${dateText(now)}${remainingCount ? ` · 另 ${remainingCount} 项` : ""}`;
   text(widget, footer, 9, palette.secondary);
   return widget;
 }
