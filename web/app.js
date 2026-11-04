@@ -13,6 +13,7 @@ let importTasks = [];
 let toastTimer;
 let confirmResolver = null;
 let lastCollectionScan = null;
+const pendingPlatformActions = new Map();
 
 function escapeHTML(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -230,13 +231,16 @@ function renderPlatforms() {
   $('#platformList').innerHTML = ['chaoxing', 'xiji'].map(source => {
     const platform = state.platforms?.[source] || {};
     const authenticated = platform.status === 'authenticated';
-    const statuses = { disabled: '未选择课程', authenticated: '已确认登录', session_saved: '会话已保存 · 待检查', session_detected: '已识别登录页面 · 待验证课程', browser_open: '登录窗口已打开 · 待检查', browser_opened: '登录窗口已打开 · 待检查', not_authenticated: '登录已失效', unverified: '页面暂未识别 · 待检查', error: '暂时无法验证登录', not_connected: '尚未接入' };
+    const statuses = { disabled: '未选择课程', authenticated: '已确认登录', session_saved: '会话已保存 · 待检查', session_detected: '已识别登录页面 · 待验证课程', browser_open: '登录窗口已打开 · 待检查', browser_opened: '登录窗口已打开 · 待检查', not_authenticated: '登录已失效', unverified: '页面暂未识别 · 待检查', error: '验证未完成', not_connected: '尚未接入' };
     const status = statuses[platform.status] || '登录状态待确认';
     const description = platform.message || '请在 Mac 上打开平台登录页，由你本人输入账号、密码和验证码。';
     const sync = state.collection?.sync?.sources?.[source] || {};
     const syncDetail = `最近成功读取：${syncTime(sync.last_success_at)}${sync.scope_changed && sync.last_success_at ? '（旧课程范围）' : ''}`;
     const attemptDetail = `最近尝试：${syncTime(sync.last_attempt_at)} · ${syncResultLabel(sync.scope_changed ? 'scope_changed' : sync.last_result)}`;
-    return `<article class="platform-card"><div class="platform-top"><span class="platform-mark" aria-hidden="true">${source === 'chaoxing' ? '学' : '希'}</span><div><h3>${sourceName(source)}</h3><p>${source === 'chaoxing' ? '作业 · 考试' : '武汉大学 · 在线作业'}</p></div></div><span class="status-pill${authenticated ? '' : ' waiting'}">${status}</span><p>${escapeHTML(description)}</p><div class="platform-sync-detail"><p>${escapeHTML(syncDetail)}</p><p>${escapeHTML(attemptDetail)}</p></div><div class="platform-actions"><button class="button secondary" data-check-login="${source}">检查登录状态</button><button class="button secondary" data-connect="${source}">打开登录窗口 ↗</button><button class="button secondary" data-finish-login="${source}">完成登录并关闭专用窗口</button></div></article>`;
+    const pending = pendingPlatformActions.get(source);
+    const disabled = pending ? ' disabled' : '';
+    const hint = platform.status === 'error' ? '<p class="fine-print">本次网页读取未完成，尚不能判断会话是否有效。请先确认平台网页能正常加载，再检查登录状态。</p>' : '';
+    return `<article class="platform-card"><div class="platform-top"><span class="platform-mark" aria-hidden="true">${source === 'chaoxing' ? '学' : '希'}</span><div><h3>${sourceName(source)}</h3><p>${source === 'chaoxing' ? '作业 · 考试' : '武汉大学 · 在线作业'}</p></div></div><span class="status-pill${authenticated ? '' : ' waiting'}">${status}</span><p>${escapeHTML(description)}</p>${hint}<div class="platform-sync-detail"><p>${escapeHTML(syncDetail)}</p><p>${escapeHTML(attemptDetail)}</p></div><div class="platform-actions"><button class="button secondary" data-check-login="${source}"${disabled}>${pending === 'probe' ? '正在检查…' : '检查登录状态'}</button><button class="button secondary" data-connect="${source}"${disabled}>${pending === 'open' ? '正在打开窗口…' : '打开登录窗口 ↗'}</button><button class="button secondary" data-finish-login="${source}"${disabled}>${pending === 'finish' ? '正在确认登录…' : '完成登录并关闭专用窗口'}</button></div></article>`;
   }).join('');
 }
 function renderSettings() {
@@ -336,18 +340,25 @@ async function syncCalendar(button) {
     } catch (error) { $('#calendarMessage').textContent = error.message; toast(error.message); }
   });
 }
+async function platformAction(source, action, work) {
+  if (pendingPlatformActions.has(source)) return;
+  pendingPlatformActions.set(source, action);
+  renderPlatforms();
+  try { return await work(); }
+  finally { pendingPlatformActions.delete(source); renderPlatforms(); }
+}
 async function connectPlatform(source, button) {
-  await busy(button, '正在打开登录页…', async () => {
+  await platformAction(source, 'open', async () => {
     try {
       const result = await api('/api/collection/open', { method: 'POST', body: JSON.stringify({ source }) });
       $('#collectionMessage').textContent = result.message || '已在 Mac 上打开平台登录页。请本人完成账号登录，再打开作业或考试列表。手机和平板可查看已保存的安排。';
       await refresh({ silent: true });
-      toast(result.ok === false ? result.message || '未能打开登录页。' : '本人登录后，点击“完成登录并关闭专用窗口”，再立即同步。');
+      toast(result.ok === false || result.navigation_pending ? result.message || '未能打开登录页。' : '本人登录后，点击“完成登录并关闭专用窗口”，再立即同步。');
     } catch (error) { $('#collectionMessage').textContent = error.message; toast(error.message); }
   });
 }
 async function checkPlatformLogin(source, button, finish = false) {
-  await busy(button, '正在检查…', async () => {
+  await platformAction(source, finish ? 'finish' : 'probe', async () => {
     try {
       const result = await api(`/api/collection/${finish ? 'finish-login' : 'probe'}`, { method: 'POST', body: JSON.stringify({ source }) });
       let message = result.message || '登录状态已检查。';

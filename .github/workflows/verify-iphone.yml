@@ -1,4 +1,4 @@
-name: Verify iPhone alarm app
+name: Verify Keqi
 
 on:
   push:
@@ -7,8 +7,13 @@ on:
       - 'ios/**/*.pbxproj'
       - 'ios/**/*.plist'
       - 'ios/**/*.xcscheme'
+      - 'server.py'
+      - 'studyreminder/**'
+      - 'web/**'
+      - 'native/**'
+      - 'requirements.txt'
+      - 'scripts/**'
       - 'widgets/**'
-      - 'web/widgets/**'
       - 'tests/**'
       - '.github/workflows/verify-iphone.yml'
   workflow_dispatch:
@@ -18,7 +23,7 @@ permissions:
 
 jobs:
   iphone-build:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 20
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
@@ -39,5 +44,6 @@ jobs:
           python3 -m venv .venv
           .venv/bin/python -m pip install -r requirements.txt
           .venv/bin/python -W error::ResourceWarning -m unittest discover -s tests -q
+          node tests/test_platform_actions.js
           node tests/test_widget.js
           TZ=America/Los_Angeles node tests/test_widget.js

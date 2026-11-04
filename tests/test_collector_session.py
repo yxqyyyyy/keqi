@@ -3,7 +3,7 @@ import copy
 import tempfile
 import unittest
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -143,6 +143,67 @@ class SessionTests(unittest.TestCase):
                         collector.request(action, "chaoxing")
                         future.result.assert_called_with(timeout=timeout)
             collector.thread.start.assert_not_called()
+
+    def test_login_actions_fail_fast_while_scan_is_running_or_queued(self):
+        for queued in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                collector = BrowserCollector(directory)
+                running = Future()
+                if queued:
+                    collector._pending_requests[running] = ("scan", {})
+                else:
+                    collector._active_job = ("scan", {}, running)
+                with patch("studyreminder.collector.importlib.util.find_spec", return_value=object()):
+                    for action in ("open", "probe", "finish_login"):
+                        with self.subTest(action=action, queued=queued), self.assertRaisesRegex(ValueError, "正在同步课程"):
+                            collector.request(action, "xiji")
+                self.assertEqual(collector.jobs.qsize(), 0)
+                self.assertIsNone(collector.thread)
+
+    def test_duplicate_or_overlapping_login_requests_are_not_queued(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = BrowserCollector(directory)
+            outstanding = Future()
+            collector._pending_requests[outstanding] = ("open", "xiji")
+            with patch("studyreminder.collector.importlib.util.find_spec", return_value=object()):
+                for action, source in (("open", "xiji"), ("probe", "xiji"), ("finish_login", "xiji"), ("open", "chaoxing")):
+                    with self.subTest(action=action, source=source), self.assertRaisesRegex(ValueError, "正在处理登录"):
+                        collector.request(action, source)
+            self.assertEqual(collector.jobs.qsize(), 0)
+
+    def test_queue_wait_timeout_cancels_job_and_clears_pending_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = BrowserCollector(directory)
+            collector.thread = Mock()
+            collector.thread.is_alive.return_value = True
+            queued = Future()
+            with patch("studyreminder.collector.importlib.util.find_spec", return_value=object()), \
+                    patch("studyreminder.collector.Future", return_value=queued), \
+                    patch.object(queued, "result", side_effect=FutureTimeoutError):
+                with self.assertRaisesRegex(ValueError, "尚未开始的请求已取消"):
+                    collector.request("open", "xiji")
+            self.assertTrue(queued.cancelled())
+            self.assertEqual(collector._pending_requests, {})
+            self.assertIs(collector.jobs.get_nowait()[2], queued)
+
+    def test_running_timeout_keeps_guard_until_operation_finishes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = BrowserCollector(directory)
+            collector.thread = Mock()
+            collector.thread.is_alive.return_value = True
+            running = Future()
+            self.assertTrue(running.set_running_or_notify_cancel())
+            with patch("studyreminder.collector.importlib.util.find_spec", return_value=object()), \
+                    patch("studyreminder.collector.Future", return_value=running), \
+                    patch.object(running, "result", side_effect=FutureTimeoutError):
+                with self.assertRaisesRegex(ValueError, "仍在处理中"):
+                    collector.request("open", "xiji")
+                with self.assertRaisesRegex(ValueError, "正在处理登录"):
+                    collector.request("open", "xiji")
+            self.assertFalse(running.cancelled())
+            self.assertIn(running, collector._pending_requests)
+            running.set_result({"ok": True})
+            self.assertEqual(collector._pending_requests, {})
 
     def test_session_keeps_only_task_platforms_and_uses_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -558,6 +619,75 @@ class AutomaticCollectionTests(unittest.TestCase):
             value.request_factory.assert_not_called()
             self.assertEqual(len(value.browser.pages), 2)
             value.browser.close.assert_called_once()
+
+    def test_cancelled_queued_open_never_launches_or_navigates_browser(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = BrowserCollector(directory)
+
+            def cancel_next_open():
+                collector.jobs.jobs[0][2].cancel()
+
+            value = self.run_worker(collector, [cancel_next_open, ("open", "xiji"), ("restore", "chaoxing")])
+            self.assertTrue(value.results[0].cancelled())
+            self.assertTrue(value.results[1].result()["ok"])
+            value.launch.assert_not_called()
+            self.assertEqual(value.browser.pages, [])
+            self.assertIsNone(collector._active_job)
+
+    def test_slow_login_navigation_shows_existing_window_without_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = BrowserCollector(directory)
+            browser = FakeBrowser()
+            page = FakePage()
+
+            def navigate(url, **kwargs):
+                page.bring_to_front.assert_called_once()
+                self.assertEqual(kwargs, {"wait_until": "commit", "timeout": 12000})
+                page.url = url
+                raise TimeoutError("synthetic platform timeout with private-url?ticket=not-for-display")
+
+            page.goto = Mock(side_effect=navigate)
+
+            def new_page():
+                browser.pages.append(page)
+                return page
+
+            browser.new_page = new_page
+            value = self.run_worker(collector, [("open", "xiji"), ("open", "xiji")], browser=browser)
+            first = value.results[0].result()
+            self.assertTrue(first["ok"])
+            self.assertTrue(first["navigation_pending"])
+            self.assertIn("登录窗口已打开", first["message"])
+            self.assertNotIn("Chrome", first["message"])
+            self.assertNotIn("private-url", first["message"])
+            self.assertEqual(collector.status["xiji"]["status"], "browser_open")
+            self.assertEqual(value.launch.call_args.kwargs["timeout"], 20000)
+            page.goto.assert_called_once()
+            self.assertEqual(page.bring_to_front.call_count, 2)
+            page.reload.assert_not_called()
+
+    def test_failed_login_navigation_does_not_leak_error_url_or_claim_launch_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            collector = BrowserCollector(directory)
+            browser = FakeBrowser()
+            page = FakePage()
+            page.goto = Mock(side_effect=RuntimeError("net::ERR_FAILED https://private.example/?ticket=hidden"))
+
+            def new_page():
+                browser.pages.append(page)
+                return page
+
+            browser.new_page = new_page
+            value = self.run_worker(collector, [("open", "xiji")], browser=browser)
+            reply = value.results[0].result()
+            self.assertTrue(reply["ok"])
+            self.assertTrue(reply["navigation_pending"])
+            self.assertIn("登录窗口已打开", reply["message"])
+            self.assertNotIn("private.example", reply["message"])
+            self.assertNotIn("hidden", json.dumps(reply))
+            self.assertEqual(collector.status["xiji"]["status"], "browser_open")
+            page.bring_to_front.assert_called_once()
+            page.reload.assert_not_called()
 
     def test_xiji_window_defers_course_collection_but_probes_login_without_page_operations(self):
         with tempfile.TemporaryDirectory() as directory:

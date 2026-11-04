@@ -13,7 +13,7 @@ import json
 import queue
 import re
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -118,6 +118,8 @@ class BrowserCollector:
         self.jobs = queue.Queue()
         self.thread = None
         self.lock = threading.Lock()
+        self._pending_requests = {}
+        self._active_job = None
         self.status = {k: {"status": "not_connected", "message": "需本人登录后接入；尚未验证课程页面"} for k in PLATFORMS}
         # A restart has not verified platform authentication. Distinguish a
         # saved cookie jar from no connection without any browser or network.
@@ -244,14 +246,36 @@ class BrowserCollector:
         if importlib.util.find_spec("playwright") is None:
             raise ValueError("尚未安装采集依赖。请先运行 scripts/安装采集依赖.command，再重启程序")
         with self.lock:
+            if action in {"open", "probe", "finish_login"}:
+                jobs = list(self._pending_requests.values())
+                if self._active_job is not None:
+                    jobs.append(self._active_job[:2])
+                if any(name == "scan" for name, _ in jobs):
+                    raise ValueError("正在同步课程，请等本次同步完成后再操作登录；不会重复打开登录窗口。")
+                if any(name in {"open", "probe", "finish_login"} for name, _ in jobs):
+                    raise ValueError("正在处理登录窗口或检查登录，请等待当前操作完成，不要重复点击。")
+            future = Future()
+            self._pending_requests[future] = (action, source)
+            future.add_done_callback(self._forget_request)
             if not self.thread or not self.thread.is_alive():
                 self.thread = threading.Thread(target=self._run, daemon=True, name="browser-collector")
                 self.thread.start()
-        future = Future()
-        self.jobs.put((action, source, future))
+            self.jobs.put((action, source, future))
         # Both adapters and course restoration run serially. Their combined
         # request budgets can exceed 100 seconds even without a stuck request.
-        return future.result(timeout=180 if action == "scan" else 100)
+        try:
+            return future.result(timeout=180 if action == "scan" else 100)
+        except FutureTimeoutError:
+            if future.cancel():
+                raise ValueError("等待操作超时，尚未开始的请求已取消，不会稍后自动打开登录窗口。") from None
+            raise ValueError("本次操作仍在处理中，请稍后查看状态，不要重复打开登录窗口。") from None
+        finally:
+            if future.done():
+                self._forget_request(future)
+
+    def _forget_request(self, future):
+        with self.lock:
+            self._pending_requests.pop(future, None)
 
     def _run(self):
         from playwright.sync_api import sync_playwright
@@ -356,6 +380,12 @@ class BrowserCollector:
 
             while True:
                 action, source, future = self.jobs.get()
+                # A request that timed out while queued must never open a
+                # browser later. Running jobs retain their in-flight guard.
+                if not future.set_running_or_notify_cancel():
+                    continue
+                with self.lock:
+                    self._active_job = (action, source, future)
                 try:
                     if action not in {"open", "probe", "finish_login", "restore", "scan", "save_session", "inspect", "close"}:
                         raise ValueError("未知采集动作")
@@ -383,7 +413,7 @@ class BrowserCollector:
                         self.profile.mkdir(parents=True, exist_ok=True)
                         self.profile.chmod(0o700)
                         chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-                        options = {"headless": False, "viewport": {"width": 1280, "height": 900}}
+                        options = {"headless": False, "viewport": {"width": 1280, "height": 900}, "timeout": 20000}
                         if chrome.exists():
                             options["executable_path"] = str(chrome)
                         browser_context = pw.chromium.launch_persistent_context(str(self.profile), **options)
@@ -414,11 +444,22 @@ class BrowserCollector:
                                                   browser_source=source if action in {"probe", "finish_login"} else None)
                     if action == "open":
                         page = next((p for p in context.pages if platform_for(p.url) == source), None) or context.new_page()
-                        if platform_for(page.url) != source:
-                            page.goto(PLATFORMS[source], wait_until="domcontentloaded", timeout=60000)
                         page.bring_to_front()
-                        self.status[source] = {"status": "browser_open", "message": "浏览器已打开；请登录并进入作业或考试列表，随后采集核对"}
-                        reply = {"ok": True, "message": "请在专用浏览器中本人登录，打开各课程的作业/考试列表。不会自动开始考试或提交作业。"}
+                        self.status[source] = {"status": "browser_open", "message": "专用登录窗口已打开，平台页面正在加载；请本人登录后检查登录状态。"}
+                        navigation_pending = False
+                        if platform_for(page.url) != source:
+                            try:
+                                # Commit does not wait for slow third-party
+                                # resources or all platform scripts to finish.
+                                page.goto(PLATFORMS[source], wait_until="commit", timeout=12000)
+                            except Exception as exc:
+                                if "closed" in str(exc).lower():
+                                    raise
+                                navigation_pending = True
+                        message = ("登录窗口已打开，但平台连接较慢或暂时失败；请在原窗口等待页面加载后再检查登录，无需反复打开。"
+                                   if navigation_pending else "请在专用浏览器中本人登录，随后点击“完成登录并关闭专用窗口”。")
+                        self.status[source] = {"status": "browser_open", "message": message}
+                        reply = {"ok": True, "navigation_pending": navigation_pending, "message": message}
                     elif action == "restore":
                         # Preparing a saved session requires no network client,
                         # browser navigation or cookie injection into pages.
@@ -670,12 +711,19 @@ class BrowserCollector:
                             self.session_warning = "本次登录会话未能保存，重启后可能需要本人重新登录"
                     # Browser exceptions can contain private URLs; keep diagnostics local and concise.
                     if not isinstance(exc, ValueError):
-                        message = ("登录浏览器未能打开。请确认 Chrome 已安装后重试。" if action == "open" else
+                        message = (("专用登录窗口已关闭，请重新打开登录窗口。" if "closed" in str(exc).lower() else
+                                    "专用登录窗口暂未启动，请稍后重试；已保存的登录会话会保留。") if action == "open" else
                                    "后台读取未能完成，请检查网络后重试；登录失效时请本人点击平台登录按钮。")
+                    if action == "open" and source in PLATFORMS:
+                        self.status[source] = {"status": "error", "message": message}
                     if not future.done():
                         future.set_exception(ValueError(message))
                     if action == "close":
                         return
+                finally:
+                    with self.lock:
+                        if self._active_job is not None and self._active_job[2] is future:
+                            self._active_job = None
 
     def close(self):
         if self.thread and self.thread.is_alive():
