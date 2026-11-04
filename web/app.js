@@ -36,6 +36,26 @@ function formatDate(value, options = {}) {
   if (!validDate(value)) return '时间待核对';
   return new Intl.DateTimeFormat('zh-CN', { timeZone: ZONE, ...options }).format(new Date(value));
 }
+function syncTime(value) {
+  return validDate(value) ? formatDate(value, { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : '尚无记录';
+}
+function syncResultLabel(result) {
+  return ({ never: '尚未同步', running: '正在读取平台', success: '已成功读取', partial: '部分课程未完成', failed: '本次读取失败', scope_changed: '课程范围已改变，待核对', interrupted: '上次读取已中断', disabled: '未选择课程' })[result] || '状态待确认';
+}
+function renderSyncTimes() {
+  const sync = state.collection?.sync || {};
+  const calendar = state.calendar_sync || {};
+  $('#syncResult').textContent = syncResultLabel(sync.scope_changed ? 'scope_changed' : sync.last_result);
+  $('#platformSyncTime').textContent = `平台最近完整同步：${syncTime(sync.last_success_at)}${sync.scope_changed && sync.last_success_at ? '（旧课程范围）' : ''}`;
+  $('#sourceSyncTimes').textContent = ['chaoxing', 'xiji'].map(source => {
+    const info = sync.sources?.[source] || {};
+    return `${sourceName(source)}：${info.configured === false ? '未选择课程' : `${syncTime(info.last_success_at)}${info.scope_changed && info.last_success_at ? '（旧范围）' : ''}`}`;
+  }).join(' · ');
+  const daily = state.settings?.daily || {};
+  $('#syncAttemptTime').textContent = `最近尝试：${syncTime(sync.last_attempt_at)} · ${daily.enabled ? `每日 ${daily.time || '08:00'} 计划读取，提醒前额外核对` : '每日自动读取已关闭'}`;
+  const calendarSuccess = calendar.last_success_at || (calendar.ok === true ? calendar.last_run : null);
+  $('#calendarSyncTime').textContent = `最近写入 Apple 日历：${syncTime(calendarSuccess)}${calendar.needs_sync ? ' · 有更新待写入' : ''}${calendar.ok === false ? ' · 本次写入未完成' : ''}`;
+}
 function localInput(value) {
   if (!validDate(value)) return '';
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: ZONE, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(value));
@@ -111,7 +131,7 @@ function render() {
   $('#weekCount').innerHTML = `${upcoming.filter(task => new Date(task.due_at).getTime() - now <= 7 * 86400000).length}<small>项待办</small>`;
   $('#examCount').innerHTML = `${upcoming.filter(task => task.kind === 'exam').length}<small>场考试</small>`;
   $('#todayLabel').textContent = formatDate(new Date(), { month: 'long', day: 'numeric', weekday: 'long' });
-  $('#accountNudge').hidden = ['chaoxing', 'xiji'].some(source => ['authenticated', 'session_detected'].includes(state.platforms?.[source]?.status));
+  $('#accountNudge').hidden = ['chaoxing', 'xiji'].some(source => ['authenticated', 'session_detected', 'session_saved'].includes(state.platforms?.[source]?.status));
   if (!pending.length) $('#agendaSummary').textContent = state.tasks.length ? '所有安排都已完成，留一点时间给自己。' : '还没有安排。添加下一次截止，从容准备。';
   else if (overdue) $('#agendaSummary').textContent = `${pending.length} 项安排待完成，其中 ${overdue} 项已过截止。完成后记得勾选。`;
   else $('#agendaSummary').textContent = `${pending.length} 项安排待完成。按自己的节奏，一件一件来。`;
@@ -119,6 +139,7 @@ function render() {
   renderTasks();
   renderPlatforms();
   renderSettings();
+  renderSyncTimes();
   if (state.collection?.last_scan && state.collection.last_scan !== lastCollectionScan && !$('#candidateArea').contains(document.activeElement)) {
     lastCollectionScan = state.collection.last_scan;
     candidates = state.collection.candidates || [];
@@ -144,7 +165,7 @@ function countdown(task) {
   if (task.status === 'completed') return { text: '已完成', urgent: false };
   const delta = new Date(task.due_at).getTime() - Date.now();
   if (!Number.isFinite(delta)) return { text: '请核对时间', urgent: true };
-  if (delta < 0) return { text: '已过截止', urgent: true };
+  if (delta < 0) return { text: task.kind === 'lecture' ? '已开始' : '已过截止', urgent: true };
   if (delta < 3600000) return { text: `剩余 ${Math.max(1, Math.ceil(delta / 60000))} 分钟`, urgent: true };
   if (delta <= 48 * 3600000) return { text: `剩余 ${Math.ceil(delta / 3600000)} 小时`, urgent: true };
   return { text: `还有 ${Math.ceil(delta / 86400000)} 天`, urgent: false };
@@ -186,8 +207,9 @@ function renderTasks() {
 function taskRow(task) {
   const count = countdown(task);
   const completed = task.status === 'completed';
-  const start = validDate(task.start_at) ? ` · 开始 ${formatDate(task.start_at, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}` : '';
-  return `<article class="task-row${completed ? ' completed' : ''}"><button class="complete-button" data-complete="${escapeHTML(task.id)}" aria-label="${completed ? '标记为待完成' : '标记为已完成'}：${escapeHTML(task.title)}" aria-pressed="${completed}">✓</button><div class="task-content"><button class="task-title" data-edit="${escapeHTML(task.id)}">${escapeHTML(task.title || '未命名安排')}</button><div class="task-meta"><span>${escapeHTML(task.course || '未填写课程')}</span><span class="source-label">${sourceName(task.source)}</span>${task.kind === 'exam' ? '<span class="kind-label">考试</span>' : ''}${start ? `<span>${escapeHTML(start.slice(3))}</span>` : ''}${safeURL(task.url) ? `<a href="${escapeHTML(safeURL(task.url))}" target="_blank" rel="noopener noreferrer" aria-label="打开${escapeHTML(task.title)}的平台页面">打开平台 ↗</a>` : ''}</div></div><div class="task-timing"><span class="task-time">${formatDate(task.due_at, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}</span><span class="task-countdown${count.urgent ? ' urgent' : ''}">${count.text}</span></div></article>`;
+  const start = task.kind !== 'lecture' && validDate(task.start_at) ? ` · 开始 ${formatDate(task.start_at, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}` : '';
+  const kindLabel = task.kind === 'exam' ? '考试' : task.kind === 'lecture' ? '上课' : '';
+  return `<article class="task-row${completed ? ' completed' : ''}"><button class="complete-button" data-complete="${escapeHTML(task.id)}" aria-label="${completed ? '标记为待完成' : '标记为已完成'}：${escapeHTML(task.title)}" aria-pressed="${completed}">✓</button><div class="task-content"><button class="task-title" data-edit="${escapeHTML(task.id)}">${escapeHTML(task.title || '未命名安排')}</button><div class="task-meta"><span>${escapeHTML(task.course || '未填写课程')}</span><span class="source-label">${sourceName(task.source)}</span>${kindLabel ? `<span class="kind-label">${kindLabel}</span>` : ''}${start ? `<span>${escapeHTML(start.slice(3))}</span>` : ''}${safeURL(task.url) ? `<a href="${escapeHTML(safeURL(task.url))}" target="_blank" rel="noopener noreferrer" aria-label="打开${escapeHTML(task.title)}的平台页面">打开平台 ↗</a>` : ''}</div></div><div class="task-timing"><span class="task-time">${task.kind === 'lecture' ? '上课 ' : ''}${formatDate(task.due_at, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}</span><span class="task-countdown${count.urgent ? ' urgent' : ''}">${count.text}</span></div></article>`;
 }
 function syncFilterControls() {
   $$('[data-status]').forEach(button => button.classList.toggle('active', button.dataset.status === filters.status));
@@ -201,15 +223,20 @@ function renderPlatforms() {
   $('#collectionError').textContent = error ? `最近同步未完成：${error}` : '';
   const daily = state.settings?.daily || {};
   const pending = state.collection?.pending_count || 0;
-  $('#collectionModeMessage').textContent = `${daily.enabled ? `每天 ${daily.time || '08:00'} 自动同步（北京时间），提醒前额外核对提交状态。` : '每日自动同步已关闭，可点击立即同步。'}${pending ? ` 当前有 ${pending} 项需核对的安排。` : ''}${state.collection?.completed_count ? ` 已识别 ${state.collection.completed_count} 项已提交记录，不设置提醒。` : ''} Mac 需运行并联网。`;
+  const retry = state.collection?.automatic_retry || {};
+  const paused = Object.keys(retry.blocked_sources || {}).map(sourceName);
+  const retryText = paused.length ? ` ${paused.join('、')}登录已失效，自动读取已暂停；本人登录后点击检查即可恢复。` : retry.daily?.attempts >= 3 ? ' 今日自动读取已达 3 次上限，可手动同步。' : '';
+  $('#collectionModeMessage').textContent = `${daily.enabled ? `每天 ${daily.time || '08:00'} 自动同步（北京时间），提醒前额外核对提交状态。` : '每日自动同步已关闭，可点击立即同步。'}${pending ? ` 当前有 ${pending} 项需核对的安排。` : ''}${state.collection?.completed_count ? ` 已识别 ${state.collection.completed_count} 项已提交记录，不设置提醒。` : ''}${retryText} Mac 需运行并联网。`;
   $('#platformList').innerHTML = ['chaoxing', 'xiji'].map(source => {
     const platform = state.platforms?.[source] || {};
     const authenticated = platform.status === 'authenticated';
-    const loggedPage = authenticated || platform.status === 'session_detected';
-    const statuses = { disabled: '未选择课程', authenticated: '已确认登录', session_detected: '已识别登录页面 · 待验证课程', browser_open: '浏览器已打开 · 待登录确认', browser_opened: '浏览器已打开 · 待登录确认', not_authenticated: '未检测到登录', unverified: '登录状态未验证', error: '接入遇到问题', not_connected: '尚未登录' };
+    const statuses = { disabled: '未选择课程', authenticated: '已确认登录', session_saved: '会话已保存 · 待检查', session_detected: '已识别登录页面 · 待验证课程', browser_open: '登录窗口已打开 · 待检查', browser_opened: '登录窗口已打开 · 待检查', not_authenticated: '登录已失效', unverified: '页面暂未识别 · 待检查', error: '暂时无法验证登录', not_connected: '尚未接入' };
     const status = statuses[platform.status] || '登录状态待确认';
     const description = platform.message || '请在 Mac 上打开平台登录页，由你本人输入账号、密码和验证码。';
-    return `<article class="platform-card"><div class="platform-top"><span class="platform-mark" aria-hidden="true">${source === 'chaoxing' ? '学' : '希'}</span><div><h3>${sourceName(source)}</h3><p>${source === 'chaoxing' ? '作业 · 考试' : '武汉大学 · 在线作业'}</p></div></div><span class="status-pill${authenticated ? '' : ' waiting'}">${status}</span><p>${escapeHTML(description)}</p><button class="button secondary" data-connect="${source}">${loggedPage ? `打开${sourceName(source)}` : `登录${sourceName(source)}`} <span aria-hidden="true">↗</span></button></article>`;
+    const sync = state.collection?.sync?.sources?.[source] || {};
+    const syncDetail = `最近成功读取：${syncTime(sync.last_success_at)}${sync.scope_changed && sync.last_success_at ? '（旧课程范围）' : ''}`;
+    const attemptDetail = `最近尝试：${syncTime(sync.last_attempt_at)} · ${syncResultLabel(sync.scope_changed ? 'scope_changed' : sync.last_result)}`;
+    return `<article class="platform-card"><div class="platform-top"><span class="platform-mark" aria-hidden="true">${source === 'chaoxing' ? '学' : '希'}</span><div><h3>${sourceName(source)}</h3><p>${source === 'chaoxing' ? '作业 · 考试' : '武汉大学 · 在线作业'}</p></div></div><span class="status-pill${authenticated ? '' : ' waiting'}">${status}</span><p>${escapeHTML(description)}</p><div class="platform-sync-detail"><p>${escapeHTML(syncDetail)}</p><p>${escapeHTML(attemptDetail)}</p></div><div class="platform-actions"><button class="button secondary" data-check-login="${source}">检查登录状态</button><button class="button secondary" data-connect="${source}">打开登录窗口 ↗</button><button class="button secondary" data-finish-login="${source}">完成登录并关闭专用窗口</button></div></article>`;
   }).join('');
 }
 function renderSettings() {
@@ -228,7 +255,7 @@ function renderSettings() {
   const synced = Boolean(sync.last_run) && sync.ok !== false && !sync.needs_sync;
   $('#calendarStatus').textContent = synced ? '已同步' : sync.available === false ? '暂不可用' : '待同步';
   $('#calendarStatus').classList.toggle('waiting', !synced);
-  $('#lastSync').textContent = sync.last_run ? `上次 ${formatDate(sync.last_run, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}` : '尚未同步';
+  $('#lastSync').textContent = `最近成功写入：${syncTime(sync.last_success_at || (sync.ok === true ? sync.last_run : null))}`;
   $('#calendarMessage').textContent = sync.message || '首次同步将在 Mac 上请求日历访问权限。';
   $('#syncCalendarButton').disabled = sync.available === false;
   const physics = state.settings?.physics || {};
@@ -240,7 +267,8 @@ function renderSettings() {
   const daily = state.settings?.daily || {};
   $('#dailyEnabled').checked = daily.enabled !== false;
   $('#dailyTime').value = daily.time || '08:00';
-  $('#dailyLastSuccess').textContent = state.collection?.daily_last_success ? `最近成功同步：${formatDate(state.collection.daily_last_success, { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}` : '尚未完成每日同步';
+  const collectionSync = state.collection?.sync || {};
+  $('#dailyLastSuccess').textContent = `平台最近完整同步：${syncTime(collectionSync.last_success_at)}${collectionSync.scope_changed && collectionSync.last_success_at ? '（旧课程范围）' : ''}；最近尝试：${syncTime(collectionSync.last_attempt_at)}。以上为北京时间。`;
   const collectionError = state.collection?.last_error?.message;
   $('#dailySyncWarning').hidden = !collectionError;
   $('#dailySyncWarning').textContent = collectionError ? `最近同步未完成：${collectionError}` : '';
@@ -274,8 +302,17 @@ function openTask(id = null) {
   $('#taskNotes').value = task?.notes || '';
   $('#taskCompleted').checked = task?.status === 'completed';
   $('#deleteTaskButton').hidden = !task;
+  updateTaskKindFields();
   $('#taskDialog').showModal();
   requestAnimationFrame(() => $('#taskTitle').focus());
+}
+function updateTaskKindFields() {
+  const lecture = $('#taskKind').value === 'lecture';
+  $('#taskStartField').hidden = lecture;
+  $('#taskDueLabel').textContent = lecture ? '上课时间' : '截止时间';
+  $('#taskTimeHint').textContent = lecture ? '以上时间为北京时间。仅记录开课时间，不推测课程时长。' : '以上时间均为北京时间。考试可填写开放时间及最晚提交时间。';
+  if (lecture) $('#taskSource').value = 'manual';
+  $('#taskSource').disabled = lecture || $('#taskSource').value === 'physics';
 }
 function confirmDelete(task) {
   $('#confirmTitle').textContent = '删除这项安排？';
@@ -305,7 +342,20 @@ async function connectPlatform(source, button) {
       const result = await api('/api/collection/open', { method: 'POST', body: JSON.stringify({ source }) });
       $('#collectionMessage').textContent = result.message || '已在 Mac 上打开平台登录页。请本人完成账号登录，再打开作业或考试列表。手机和平板可查看已保存的安排。';
       await refresh({ silent: true });
-      toast(result.ok === false ? result.message || '未能打开登录页。' : '请在 Mac 的专用浏览器中完成登录，再读取页面。');
+      toast(result.ok === false ? result.message || '未能打开登录页。' : '本人登录后，点击“完成登录并关闭专用窗口”，再立即同步。');
+    } catch (error) { $('#collectionMessage').textContent = error.message; toast(error.message); }
+  });
+}
+async function checkPlatformLogin(source, button, finish = false) {
+  await busy(button, '正在检查…', async () => {
+    try {
+      const result = await api(`/api/collection/${finish ? 'finish-login' : 'probe'}`, { method: 'POST', body: JSON.stringify({ source }) });
+      let message = result.message || '登录状态已检查。';
+      if (result.authenticated && finish) message = result.closed_login_window ? '已确认登录并保存会话，专用窗口已关闭。可点击“立即同步”。' : '已确认登录，会话已保存。可点击“立即同步”。';
+      else if (result.authenticated) message += ' 登录窗口若仍开着，请完成登录并关闭专用窗口后再同步。';
+      $('#collectionMessage').textContent = message;
+      await refresh({ silent: true });
+      toast(message);
     } catch (error) { $('#collectionMessage').textContent = error.message; toast(error.message); }
   });
 }
@@ -364,6 +414,10 @@ document.addEventListener('click', async event => {
   }
   const connectButton = event.target.closest('[data-connect]');
   if (connectButton) await connectPlatform(connectButton.dataset.connect, connectButton);
+  const checkButton = event.target.closest('[data-check-login]');
+  if (checkButton) await checkPlatformLogin(checkButton.dataset.checkLogin, checkButton);
+  const finishButton = event.target.closest('[data-finish-login]');
+  if (finishButton) await checkPlatformLogin(finishButton.dataset.finishLogin, finishButton, true);
 });
 $('#addTaskButton').addEventListener('click', () => openTask());
 $('#refreshButton').addEventListener('click', async event => { await busy(event.currentTarget, '↻', async () => { if (await refresh()) toast('安排已更新。'); }); });
@@ -374,6 +428,7 @@ $('#clearDateFilter').addEventListener('click', () => { filters.day = null; rend
 $('#sourceFilter').addEventListener('change', event => { filters.source = event.target.value; renderTasks(); });
 $('#kindFilter').addEventListener('change', event => { filters.kind = event.target.value; renderTasks(); });
 $('#searchInput').addEventListener('input', event => { filters.search = event.target.value.trim(); renderTasks(); });
+$('#taskKind').addEventListener('change', updateTaskKindFields);
 $('#taskForm').addEventListener('submit', async event => {
   event.preventDefault();
   $('#taskError').textContent = '';
@@ -382,7 +437,8 @@ $('#taskForm').addEventListener('submit', async event => {
       const id = $('#taskId').value;
       const task = { title: $('#taskTitle').value.trim(), course: $('#taskCourse').value.trim(), source: $('#taskSource').value, kind: $('#taskKind').value, start_at: inputISO($('#taskStart').value), due_at: inputISO($('#taskDue').value), url: $('#taskURL').value.trim(), notes: $('#taskNotes').value.trim(), status: $('#taskCompleted').checked ? 'completed' : 'pending' };
       if (!task.title) throw new Error('请填写任务名称。');
-      if (!task.due_at) throw new Error('请填写截止时间。');
+      if (task.kind === 'lecture') { task.source = 'manual'; task.start_at = null; }
+      if (!task.due_at) throw new Error(task.kind === 'lecture' ? '请填写上课时间。' : '请填写截止时间。');
       if (task.start_at && new Date(task.start_at) > new Date(task.due_at)) throw new Error('开始时间不能晚于截止时间。');
       await api(id ? `/api/tasks/${encodeURIComponent(id)}` : '/api/tasks', { method: id ? 'PUT' : 'POST', body: JSON.stringify(task) });
       $('#taskDialog').close();
@@ -443,7 +499,7 @@ $('#scanButton').addEventListener('click', async event => {
       candidates = Array.isArray(result.candidates) ? result.candidates : [];
       $('#candidateWarnings').hidden = !result.warnings?.length;
       $('#candidateWarnings').textContent = (result.warnings || []).join('\n');
-      $('#collectionMessage').textContent = result.coverage_complete ? `已同步 ${result.synced || 0} 项记录，新增 ${result.added || 0} 项。已提交的安排不会提醒。` : candidates.length ? `识别到 ${candidates.length} 项候选安排，请在下方核对。` : '本次未完成全部课程读取，请查看平台登录状态。';
+      $('#collectionMessage').textContent = result.coverage_complete ? `已同步 ${result.synced || 0} 项记录，新增 ${result.added || 0} 项。已提交的安排不会提醒。` : candidates.length ? `识别到 ${candidates.length} 项候选安排，请在下方核对。` : '本次未完成全部课程读取，已有安排已保留。请查看平台的检查结果。';
       if (!candidates.length && result.warnings?.length) $('#collectionMessage').textContent += ` ${result.warnings.join(' ')}`;
       renderCandidates();
       await refresh({ silent: true });

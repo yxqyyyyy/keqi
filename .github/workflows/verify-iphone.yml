@@ -1,0 +1,43 @@
+name: Verify iPhone alarm app
+
+on:
+  push:
+    paths:
+      - 'ios/**/*.swift'
+      - 'ios/**/*.pbxproj'
+      - 'ios/**/*.plist'
+      - 'ios/**/*.xcscheme'
+      - 'widgets/**'
+      - 'web/widgets/**'
+      - 'tests/**'
+      - '.github/workflows/verify-iphone.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  iphone-build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - name: Check out audited source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Verify Swift core
+        run: |
+          xcrun swift test --package-path ios/AlarmCore
+          xcrun swift run --package-path ios/AlarmCore keqi-core-check
+      - name: Build iPhone app without signing
+        run: |
+          xcodebuild -project ios/KeqiAlarm.xcodeproj -scheme KeqiAlarm \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/iphone-derived CODE_SIGNING_ALLOWED=NO build
+      - name: Verify existing app and widget
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+          .venv/bin/python -W error::ResourceWarning -m unittest discover -s tests -q
+          node tests/test_widget.js
+          TZ=America/Los_Angeles node tests/test_widget.js

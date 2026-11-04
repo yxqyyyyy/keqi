@@ -30,6 +30,7 @@ ROOT_FILES = frozenset({
     ".gitignore", "README.md", "THIRD_PARTY_NOTICES.md", "LICENSE",
     "requirements.txt", "server.py", "启动作业提醒.command",
 })
+WORKFLOW_FILE = ".github/workflows/verify-iphone.yml"
 SCRIPT_FILES = frozenset({
     "package_release.py", "manage_background_service.py", "verify_chaoxing.py",
     "verify_xiji.py", "安装采集依赖.command", "build_calendar_bridge.sh",
@@ -42,6 +43,15 @@ TREE_SUFFIXES = {
     "native": frozenset({".swift"}),
     "docs": frozenset({".md"}),
 }
+IOS_FILES = frozenset({
+    "ios/README.md", "ios/AlarmCore/Package.swift", "ios/KeqiAlarm/Info.plist",
+    "ios/KeqiAlarm.xcodeproj/project.pbxproj",
+    "ios/KeqiAlarm.xcodeproj/xcshareddata/xcschemes/KeqiAlarm.xcscheme",
+})
+IOS_SOURCE_DIRECTORIES = frozenset({
+    "ios/KeqiAlarm", "ios/AlarmCore/Sources/KeqiAlarmCore",
+    "ios/AlarmCore/Sources/AlarmCoreChecks", "ios/AlarmCore/Tests/KeqiAlarmCoreTests",
+})
 FORBIDDEN_PARTS = frozenset({
     "data", "build", "dist", "node_modules", "__pycache__", "logs", "log",
     "backup", "backups", "exports", "browser-profile", "browser-session",
@@ -93,8 +103,13 @@ def allowed_source(relative: PurePosixPath) -> bool:
         return False
     if len(parts) == 1:
         return parts[0] in ROOT_FILES
+    if str(relative) == WORKFLOW_FILE:
+        return True
     if not _safe_parts(relative) or (PRIVATE_NAME.search(relative.name) and str(relative) not in SAFE_NAMED_SOURCES):
         return False
+    if parts[0] == "ios":
+        return (str(relative) in IOS_FILES or
+                (relative.parent.as_posix() in IOS_SOURCE_DIRECTORIES and relative.suffix == ".swift"))
     tree = parts[0]
     if tree == "scripts":
         return len(parts) == 2 and relative.name in SCRIPT_FILES
@@ -213,6 +228,23 @@ def collect_sources(root: Path) -> dict[str, SourceFile]:
 
     for name in sorted(set(TREE_SUFFIXES) | {"scripts"}):
         scan(root / name, recursive=name == "web")
+    for relative in sorted(IOS_FILES):
+        path = root / relative
+        if path.exists() or path.is_symlink():
+            # Validate each parent before opening a whitelisted iPhone file.
+            if any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
+                raise ReleaseError("iPhone 源码目录不能包含符号链接。")
+            add(path)
+    workflow = root / WORKFLOW_FILE
+    if workflow.exists() or workflow.is_symlink():
+        if any(parent.is_symlink() for parent in workflow.parents if parent != root and root in parent.parents):
+            raise ReleaseError("工作流源码目录不能包含符号链接。")
+        add(workflow)
+    for relative in sorted(IOS_SOURCE_DIRECTORIES):
+        path = root / relative
+        if any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
+            raise ReleaseError("iPhone 源码目录不能包含符号链接。")
+        scan(path)
     if not files:
         raise ReleaseError("未找到可发布的源码文件。")
     if sum(len(source.content) for source in files.values()) > MAX_TOTAL_BYTES:

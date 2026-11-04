@@ -12,13 +12,15 @@ import html
 import re
 import time
 from datetime import datetime
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 from .chaoxing_adapter import _Node, _Tree
 from .core import TZ
 
 ORIGIN = "https://cslabcg.whu.edu.cn"
 MAIN = ORIGIN + "/main.jsp"
+HOME = ORIGIN + "/"
+_CAMPUS_LOGIN = "https://cas.whu.edu.cn/authserver/login?" + urlencode({"service": HOME})
 COURSE_SCOPE = ("计算机组成", "离散数学")
 _DATE = re.compile(r"20\d{2}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}日?[ T\s]+\d{1,2}[:：]\d{2}(?:[:：]\d{2})?")
 _ASSIGN_PATH = "/assignment/index.jsp"
@@ -29,8 +31,14 @@ _ACTION_TEXT = {"进入作业", "开始作业", "查看", "详情", "作答", "�
 def _route(url):
     try:
         parsed = urlparse(url)
+        path = parsed.path
+        # Redirects are untrusted. Tickets or servlet session IDs can appear
+        # in a path as well as in the query, including percent-encoded paths.
+        decoded = unquote(unquote(path))
+        if re.search(r"(?i)(?:\b(?:ST|TGT)-|(?:ticket|jsessionid|sessionid|token)\s*=)", decoded):
+            path = "/[redacted]"
         return {"host": (parsed.hostname or "")[:160],
-                "path": re.sub(r"[\x00-\x20\x7f]", "", parsed.path)[:240] or "/"}
+                "path": re.sub(r"[\x00-\x20\x7f]", "", path)[:240] or "/"}
     except ValueError:
         return {"host": "invalid", "path": "/"}
 
@@ -42,10 +50,11 @@ def _params(url):
 def _safe_url(url):
     try:
         parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname != "cslabcg.whu.edu.cn" or parsed.port not in (None, 443) or parsed.username or parsed.password or parsed.fragment:
+        if (parsed.scheme != "https" or parsed.hostname != "cslabcg.whu.edu.cn" or parsed.port not in (None, 443)
+                or parsed.username is not None or parsed.password is not None or parsed.fragment or parsed.params):
             return False
         query = parse_qs(parsed.query, keep_blank_values=True)
-        if parsed.path == "/main.jsp":
+        if parsed.path in {"/", "/main.jsp"}:
             return not query
         # The actual assignment menu uses courseID + assignID for metadata.
         # Only those numeric fields are admitted; question/answer routes are not.
@@ -53,6 +62,47 @@ def _safe_url(url):
             return not query or (set(query) <= {"courseID", "assignID"} and "assignID" in query
                                  and all(len(values) == 1 and re.fullmatch(r"\d+", values[0]) for values in query.values()))
         return parsed.path == "/includes/redirect.jsp" and query in ({"tab": ["-1"]}, {"tab": ["-2"]}, {"tab": ["-3"]})
+    except ValueError:
+        return False
+
+
+def _campus_ticket_url(url):
+    """Accept one CAS ST ticket only at the originally authorized service."""
+    try:
+        parsed = urlparse(url)
+        if (parsed.scheme != "https" or parsed.hostname != "cslabcg.whu.edu.cn"
+                or parsed.port not in (None, 443) or parsed.username is not None or parsed.password is not None
+                or parsed.fragment or parsed.params or parsed.path != "/" or len(parsed.query) > 4096):
+            return False
+        query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+        return (set(query) == {"ticket"} and len(query["ticket"]) == 1
+                and re.fullmatch(r"ST-[A-Za-z0-9._~-]{1,2040}", query["ticket"][0]) is not None)
+    except ValueError:
+        return False
+
+
+def _known_school_login(url):
+    """Recognize the observed login destination, without requesting it."""
+    try:
+        parsed = urlparse(url)
+        return (parsed.scheme == "https" and parsed.hostname == "cslabcg.whu.edu.cn"
+                and parsed.port in (None, 443) and parsed.username is None and parsed.password is None
+                and not parsed.fragment and not parsed.params and parsed.path == "/indexcs/simple.jsp")
+    except ValueError:
+        return False
+
+
+def _campus_portal_redirect(url):
+    """Permit a fixed MAIN recheck, never a request to this unknown target."""
+    try:
+        parsed = urlparse(url)
+        path = unquote(unquote(parsed.path)).lower()
+        return (parsed.scheme == "https" and parsed.hostname == "cslabcg.whu.edu.cn"
+                and parsed.port in (None, 443) and parsed.username is None and parsed.password is None
+                and not parsed.fragment and not parsed.params and "\\" not in path
+                and not re.search(r"[\x00-\x20\x7f]", path)
+                and not any(word in path for word in ("logout", "logoff", "signout"))
+                and not re.search(r"\b(?:st|tgt)-", path))
     except ValueError:
         return False
 
@@ -69,10 +119,84 @@ class _Reader:
     def __init__(self, context, budget=35):
         self.context, self.deadline = context, time.monotonic() + budget
         self.count, self.routes = 0, []
+        self.request_limit = 30
         self.navigation_attempted = False
+        self.empty_main_checked = False
+        self.campus_session_attempted = False
 
     def diagnostics(self):
         return {"requests": self.count, "routes": self.routes}
+
+    def reuse_campus_session(self):
+        """Redeem an existing campus SSO session without credentials or UI.
+
+        The only cross-origin request is the school's fixed CAS service URL.
+        A returned service ticket may go only to the exact HTTPS service root;
+        neither arbitrary redirects nor login forms are followed/submitted.
+        """
+        if self.campus_session_attempted:
+            return False
+        self.campus_session_attempted = True
+        try:
+            cookies = self.context.request.storage_state().get("cookies", [])
+            has_campus_session = any(isinstance(cookie, dict)
+                                     and str(cookie.get("domain", "")).lstrip(".").lower() == "cas.whu.edu.cn"
+                                     for cookie in cookies)
+        except Exception:
+            return False
+        if not has_campus_session:
+            return False
+        deadline = min(self.deadline, time.monotonic() + 15)
+        url, ticket_received = _CAMPUS_LOGIN, False
+        visited = set()
+        for _ in range(4):
+            if url in visited:
+                raise _ReadError("校园免登录恢复出现重复跳转，本次已停止，请本人检查登录")
+            visited.add(url)
+            remaining = deadline - time.monotonic()
+            if remaining < 1 or self.count >= self.request_limit:
+                raise _ReadError("校园免登录恢复达到时间或请求数上限，请稍后重试")
+            self.count += 1
+            try:
+                response = self.context.request.get(url, timeout=min(8000, max(500, int(remaining * 1000))), max_redirects=0)
+            except Exception as exc:
+                raise _ReadError("校园免登录恢复请求超时或网络失败，请稍后重试") from exc
+            event = {**_route(url), "status": response.status, "purpose": "campus_session_reuse"}
+            self.routes.append(event)
+            if response.status == 200:
+                # CAS HTML can require a password, captcha, or an explicit
+                # confirmation. Never inspect field values or submit its form.
+                # The platform response still must pass a fresh _probe below.
+                return ticket_received and urlparse(url).hostname == "cslabcg.whu.edu.cn"
+            if not 300 <= response.status < 400:
+                if response.status in {401, 403}:
+                    return False
+                raise _ReadError("校园免登录恢复暂未成功（HTTP " + str(response.status) + "），请稍后重试")
+            target = urljoin(url, response.headers.get("location", ""))
+            if url == _CAMPUS_LOGIN:
+                if not _campus_ticket_url(target):
+                    event["result"] = "blocked_sso_redirect"
+                    event["redirect"] = {"host": "unverified", "path": "/[redacted]"}
+                    raise _ReadError("校园免登录恢复返回了未确认的跳转，本次已停止，请本人检查登录")
+                ticket_received = True
+            elif _known_school_login(target):
+                event["result"] = "login_required"
+                event["redirect"] = _route(target)
+                raise _LoginRequired("校园免登录未能恢复希冀授权，请本人在专用窗口登录一次并完成保存；程序之后会复用有效会话")
+            elif target not in {HOME, MAIN}:
+                event["redirect"] = _route(target)
+                if ticket_received and _campus_portal_redirect(target):
+                    # The ticket request already updated the cookie jar. A
+                    # portal redirect need not be followed to prove login:
+                    # only the fixed, read-only MAIN probe may establish it.
+                    event["result"] = "verify_main_after_service_redirect"
+                    return True
+                event["result"] = "blocked_sso_redirect"
+                raise _ReadError("校园免登录恢复返回了未确认的跳转，本次已停止，请本人检查登录")
+            # Query strings (including one-time CAS tickets) never enter logs.
+            event["redirect"] = _route(target)
+            url = target
+        raise _ReadError("校园免登录恢复跳转次数异常，本次已停止，请本人检查登录")
 
     def get(self, url):
         for _ in range(5):
@@ -81,7 +205,7 @@ class _Reader:
                 self.routes.append({**route, "result": "blocked_route"})
                 raise _ReadError("希冀返回未确认的只读路径，已停止读取（" + route["host"] + route["path"] + "）")
             remaining = self.deadline - time.monotonic()
-            if remaining < 1 or self.count >= 30:
+            if remaining < 1 or self.count >= self.request_limit:
                 raise _ReadError("希冀采集达到时间或请求数上限，结果可能不完整")
             if self.count:
                 time.sleep(min(0.2, max(0, remaining - 0.5)))
@@ -96,8 +220,13 @@ class _Reader:
             if 300 <= status < 400:
                 target = urljoin(url, response.headers.get("location", ""))
                 event["redirect"] = _route(target)
-                if any(part in urlparse(target).path.lower() for part in ("login", "signin")):
-                    raise _LoginRequired("希冀登录已失效，请在专用浏览器中本人重新登录")
+                # The deployed school's home route redirects an expired
+                # session to this observed account-login page; main.jsp can
+                # instead return an empty HTTP 200 for the same session.
+                # Unknown paths containing "login" may be success portals;
+                # an unsupported redirect is a read failure, not a logout.
+                if _known_school_login(target):
+                    raise _LoginRequired("本程序保存的希冀登录会话已失效，请从“打开登录窗口”本人登录，再点击“完成登录并关闭专用窗口”；平时浏览器的登录不会自动传入本程序")
                 url = target
                 continue
             if status in {401, 403}:
@@ -107,6 +236,16 @@ class _Reader:
             if status != 200:
                 raise _ReadError("希冀未能返回课程列表（HTTP " + str(status) + "）")
             source = response.text()
+            if not source.strip():
+                if url == MAIN and not self.empty_main_checked:
+                    self.empty_main_checked = True
+                    try:
+                        return self.get(HOME)
+                    except _LoginRequired:
+                        raise
+                    except _ReadError:
+                        pass
+                raise _ReadError("希冀课程主页返回空白内容，暂时无法检查登录；这不代表账号未登录，请稍后点击“检查登录状态”")
             if len(source) > 4_000_000:
                 raise _ReadError("希冀页面超出预期大小，已停止解析")
             tree = _Tree(source).root
@@ -122,14 +261,14 @@ class _Reader:
                       and urljoin(MAIN, form.attrs.get("action", "")) == MAIN
                       and {node.attrs.get("name") for node in form.walk() if node.tag == "input"} == {"changeCourse", "doChangeCourse"}
                       and any(node.tag == "input" and node.attrs.get("name") == "doChangeCourse" and node.attrs.get("value") == "true" for node in form.walk())), None)
-        choices = {node.attrs.get("value") for node in main.walk() if node.has_class("dropdown-item-course")}
+        choices = {entry["id"] for entry in _course_entries(main, None)}
         binding = any(".dropdown-item-course" in "".join(child for child in node.children if isinstance(child, str))
                       and "document.courseForm.changeCourse.value = id" in "".join(child for child in node.children if isinstance(child, str))
                       and "document.courseForm.submit()" in "".join(child for child in node.children if isinstance(child, str)) for node in main.walk() if node.tag == "script")
         if not valid or not binding or course_id not in choices or not re.fullmatch(r"\d+", course_id or ""):
             raise _ReadError("希冀课程切换表单与已验证结构不一致，未执行切换")
         remaining = self.deadline - time.monotonic()
-        if remaining < 1 or self.count >= 30:
+        if remaining < 1 or self.count >= self.request_limit:
             raise _ReadError("希冀采集达到时间或请求数上限，未切换课程")
         self.count += 1
         self.navigation_attempted = True
@@ -177,13 +316,36 @@ def _probe(reader):
     account = any(node.attrs.get("id") == "userDropdown" or (node.tag == "a" and "退出" in node.text()) for node in tree.walk())
     authenticated = len(navigation) == 3 and account
     return {"authenticated": authenticated, "status": "authenticated" if authenticated else "unverified",
-            "message": "希冀登录已通过服务端课程导航校验" if authenticated else "尚未确认希冀登录成功，请完成登录并打开课程主页后重试",
+            "message": "希冀登录已通过服务端课程导航校验" if authenticated else "希冀页面结构暂未识别，无法确认登录；请先检查专用窗口是否显示课程主页，再点击“检查登录状态”",
             "signals": (["course_navigation"] if len(navigation) == 3 else []) + (["account_control"] if account else [])}, tree
+
+
+def _probe_with_campus_session(reader):
+    try:
+        return _probe(reader)
+    except _LoginRequired:
+        # The entire recovery, including final platform verification, gets at
+        # most five requests and fifteen seconds. Normal collection afterwards
+        # keeps its original, already elapsed overall budget.
+        original_deadline, original_limit = reader.deadline, reader.request_limit
+        reader.deadline = min(reader.deadline, time.monotonic() + 15)
+        reader.request_limit = min(reader.request_limit, reader.count + 5)
+        try:
+            if not reader.reuse_campus_session():
+                raise _LoginRequired("本程序保存的希冀会话目前需要本人验证，请在专用窗口登录一次并完成保存；程序会复用保存的会话，学校要求重新验证时仍需本人登录")
+            reader.empty_main_checked = False
+            auth, tree = _probe(reader)
+        finally:
+            reader.deadline, reader.request_limit = original_deadline, original_limit
+    if auth["authenticated"]:
+        auth["signals"].append("campus_session_reused")
+        auth["message"] = "已复用保存的校园免登录会话，希冀登录已通过服务端课程导航校验"
+    return auth, tree
 
 
 def probe_xiji_auth(context):
     try:
-        auth, _ = _probe(_Reader(context, budget=15))
+        auth, _ = _probe_with_campus_session(_Reader(context, budget=20))
         return auth
     except _LoginRequired as exc:
         return {"authenticated": False, "status": "not_authenticated", "message": str(exc), "signals": []}
@@ -293,13 +455,13 @@ def _frame_course(context, course_scope=COURSE_SCOPE):
     return next(iter(names)) if len(names) == 1 else ""
 
 
-def _current_course(tree, course_scope=COURSE_SCOPE):
-    """Accept explicit current-course labels, selected options, or headings."""
+def _current_course_names(tree, course_scope=COURSE_SCOPE):
+    """Collect course-selection evidence without treating menu options as it."""
     # The live course dropdown marks its selected item with this exact pair.
     marked = {" ".join(node.text().split()) for node in tree.walk()
               if node.has_class("dropdown-item-course") and node.has_class("font-weight-bold") and _scoped(node.text(), course_scope) and len(node.text()) <= 200}
     if marked:
-        return next(iter(marked)) if len(marked) == 1 else ""
+        return marked
     choices = []
     for node in tree.walk():
         if node.tag in {"h1", "h2", "h3", "h4", "h5", "h6"} or (node.tag == "option" and "selected" in node.attrs):
@@ -318,7 +480,12 @@ def _current_course(tree, course_scope=COURSE_SCOPE):
             match = re.fullmatch(r"当前课程\s*[:：]\s*(.{1,150})", text)
             if match and _scoped(match.group(1), course_scope):
                 choices.append(match.group(1))
-    unique = set(choices)
+    return set(choices)
+
+
+def _current_course(tree, course_scope=COURSE_SCOPE):
+    """Accept one explicit current-course label, selected option, or heading."""
+    unique = _current_course_names(tree, course_scope)
     return next(iter(unique)) if len(unique) == 1 else ""
 
 
@@ -510,12 +677,24 @@ def _assignments(tree, course, warnings, course_scope=COURSE_SCOPE):
 
 
 def _course_entries(tree, course_scope=COURSE_SCOPE):
-    found = {}
+    # Responsive menus may repeat the same option. They must still describe
+    # one coherent ID/name mapping; never let the final duplicate silently
+    # replace another course or hide a conflicting current-course marker.
+    found, names = {}, {}
     for node in tree.walk():
         name, value = " ".join(node.text().split()), node.attrs.get("value", "")
-        if node.has_class("dropdown-item-course") and re.fullmatch(r"\d+", value) and _scoped(name, course_scope):
-            found[value] = {"id": value, "name": name, "current": node.has_class("font-weight-bold")}
-    return sorted(found.values(), key=lambda item: not item["current"])
+        if not (node.has_class("dropdown-item-course") and re.fullmatch(r"\d+", value) and name):
+            continue
+        if ((value in found and found[value]["name"] != name)
+                or (name in names and names[name] != value)):
+            raise _ReadError("希冀课程菜单的课程ID与名称存在冲突，未执行课程切换")
+        current = node.has_class("font-weight-bold") or found.get(value, {}).get("current", False)
+        found[value] = {"id": value, "name": name, "current": current}
+        names[name] = value
+    if sum(entry["current"] for entry in found.values()) > 1:
+        raise _ReadError("希冀课程菜单出现多个当前课程，未执行课程切换")
+    return sorted((entry for entry in found.values() if _scoped(entry["name"], course_scope)),
+                  key=lambda item: not item["current"])
 
 
 def _assignment_entries(tree, course_id):
@@ -540,32 +719,249 @@ def _metadata_text(node):
     return " ".join(_metadata_text(child) if isinstance(child, _Node) else child for child in node.children)
 
 
+_SUBMITTED_LABELS = ("已提交", "已完成", "已评阅", "已批阅", "已批改", "待评阅", "待批阅", "待批改", "已交卷", "已交")
+_PENDING_LABELS = ("尚未提交", "未提交答案", "未提交", "无提交", "未完成", "待提交", "已撤回", "已退回", "未交")
+
+
+def _explicitly_hidden(node):
+    while node:
+        if ("hidden" in node.attrs or node.attrs.get("aria-hidden", "").lower() == "true"
+                or re.search(r"(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b", node.attrs.get("style", ""), re.I)):
+            return True
+        node = node.parent
+    return False
+
+
+def _submission_cell_text(node):
+    if node.tag in {"table", "script", "style", "input", "textarea", "select", "option", "pre", "code", "a", "button"}:
+        return ""
+    return " ".join(_submission_cell_text(child) if isinstance(child, _Node) else child for child in node.children)
+
+
+def _normalized_submission_text(cell):
+    """Keep explicit state words or the observed personal timestamp only."""
+    text = " ".join(_submission_cell_text(cell).split())
+    text = re.sub(r"^(?:提交状态|状态)\s*[:：]\s*", "", text)
+    tokens = [token for token in re.split(r"[\s,，;；/|、()（）]+", text) if token]
+    if tokens and all(token in _PENDING_LABELS + _SUBMITTED_LABELS for token in tokens):
+        return " ".join(tokens)
+    if any(label in text for label in _PENDING_LABELS):
+        return ""
+    dates = [match.group(1) for match in re.finditer(r"初次提交时间\s*[:：]\s*(" + _DATE.pattern + ")", text)
+             if _datetime(match.group(1))]
+    return "初次提交时间：" + dates[0] if len(set(dates)) == 1 else ""
+
+
+def _badge_tone_matches(classes, tone):
+    """Allow layout decoration while rejecting unknown/conflicting colors."""
+    if not {"badge", "badge-" + tone} <= classes:
+        return False
+    colors = {value for value in classes if value.startswith(("badge-", "bg-", "text-bg-")) and value != "badge-pill"}
+    if not colors <= {"badge-" + tone, "bg-" + tone, "text-bg-" + tone}:
+        return False
+    text_colors = {"text-" + value for value in ("primary", "secondary", "success", "danger", "warning", "info", "light", "dark", "muted")}
+    return not (classes & text_colors - {"text-" + tone})
+
+
+def _numbered_submission_statuses(tree):
+    """Read the observed two-cell question layout, not question/answer text.
+
+    Its personal state is one direct, leaf span.badge in the question's td.
+    Reject incomplete numbering, extra tables, hidden rows and conflicting or
+    mismatched badges rather than inferring completion from arbitrary text.
+    """
+    tables = [node for node in tree.walk() if node.tag == "table"]
+    if len(tables) != 1:
+        return []
+    table = tables[0]
+    ancestor = table.parent
+    while ancestor:
+        if ancestor.tag in {"table", "td", "th", "pre", "code", "textarea", "script", "style", "a", "button"}:
+            return []
+        ancestor = ancestor.parent
+    rows = [node for node in table.walk() if node.tag == "tr"]
+    if not rows or len(rows) > 100:
+        return []
+    cells_by_row, numbers = [], []
+    for row in rows:
+        cells = [node for node in row.children if isinstance(node, _Node) and node.tag in {"th", "td"}]
+        if (len(cells) != 2 or [cell.tag for cell in cells] != ["th", "td"]
+                or any(cell.attrs.get(name, "1") != "1" for cell in cells for name in ("colspan", "rowspan"))):
+            return []
+        match = re.fullmatch(r"([1-9]\d{0,2})[.．、]", " ".join(cells[0].text().split()))
+        if not match:
+            return []
+        numbers.append(int(match.group(1)))
+        cells_by_row.append(cells)
+    if numbers != list(range(1, len(rows) + 1)):
+        return []
+    statuses = []
+    for row, (number_cell, cell) in zip(rows, cells_by_row):
+        markers = [node for node in cell.children if isinstance(node, _Node) and node.tag == "span" and node.has_class("badge")]
+        status = ""
+        if len(markers) == 1 and not _explicitly_hidden(row) and not _explicitly_hidden(number_cell):
+            marker = markers[0]
+            # The real status element has no nested markup. Do not borrow
+            # badge-like markup from a nested question, answer or attachment.
+            if not _explicitly_hidden(marker) and not any(isinstance(child, _Node) for child in marker.children):
+                label = " ".join(marker.text().split())
+                classes = set(marker.attrs.get("class", "").split())
+                if label in _SUBMITTED_LABELS and _badge_tone_matches(classes, "success"):
+                    status = label
+                elif label in _PENDING_LABELS and any(_badge_tone_matches(classes, tone) for tone in ("danger", "warning")):
+                    status = label
+        statuses.append(status)
+    return statuses
+
+
 def _submission_statuses(tree):
     statuses = []
     for table in tree.walk():
         if table.tag != "table":
             continue
-        rows = [node for node in table.walk() if node.tag == "tr"]
+        ancestor, nested = table.parent, False
+        while ancestor:
+            if ancestor.tag in {"table", "td", "th", "pre", "code", "textarea", "script", "style", "a", "button"}:
+                nested = True
+                break
+            ancestor = ancestor.parent
+        if nested or _explicitly_hidden(table):
+            continue
+        rows = []
+        for node in table.walk():
+            if node.tag != "tr":
+                continue
+            parent = node.parent
+            while parent and parent.tag != "table":
+                parent = parent.parent
+            if parent is table:
+                rows.append(node)
         if not rows:
             continue
-        headers = [node.text() for node in rows[0].children if isinstance(node, _Node) and node.tag in {"th", "td"}]
+        header_cells = [node for node in rows[0].children if isinstance(node, _Node) and node.tag in {"th", "td"}]
+        if (_explicitly_hidden(rows[0]) or any(_explicitly_hidden(cell) for cell in header_cells)
+                or header_cells and re.fullmatch(r"[1-9]\d{0,2}[.．、]", " ".join(header_cells[0].text().split()))):
+            continue
+        headers = [" ".join(_submission_cell_text(node).split()) for node in header_cells]
         status_index = next((index for index, text in enumerate(headers) if "提交" in text and "状态" in text), None)
         if status_index is None:
             continue
         for row in rows[1:]:
             cells = [node for node in row.children if isinstance(node, _Node) and node.tag in {"th", "td"}]
-            if len(cells) <= status_index:
+            if (len(cells) <= status_index or _explicitly_hidden(row)
+                    or _explicitly_hidden(cells[status_index])):
+                statuses.append("")
+            else:
+                statuses.append(_normalized_submission_text(cells[status_index]))
+    return statuses if statuses else _numbered_submission_statuses(tree)
+
+
+def _submission_evidence(tree):
+    """Emit bounded row shapes and allowlisted metadata, never task contents.
+
+    Some assignment pages use numbered question rows rather than a named
+    submission-status column. Preserve their structure for diagnosis without
+    storing the question, answer, attachment, link, or form values.
+    """
+    labels = _PENDING_LABELS + _SUBMITTED_LABELS
+    date_labels = {"initial_submitted_at": "初次提交时间", "last_modified_at": "最后一次修改时间"}
+    marker_tags = {"td", "th", "span", "b", "strong", "p", "div", "label", "small", "i", "em"}
+    marker_classes = {"badge", "label", "text-success", "text-danger", "text-warning", "text-muted", "text-info",
+                      "badge-success", "badge-danger", "badge-warning", "badge-info", "label-success", "label-danger",
+                      "label-warning", "label-info", "alert", "alert-success", "alert-danger", "alert-warning",
+                      "bg-success", "bg-danger", "bg-warning", "bg-info", "text-bg-success", "text-bg-danger", "text-bg-warning"}
+    safe_tags = marker_tags | {"tr", "li", "section", "a", "button", "input", "textarea", "pre", "code", "img", "br", "svg", "path", "form", "select", "script", "style"}
+
+    def element_shape(node, cell):
+        classes = set(node.attrs.get("class", "").split())
+        child_tags = [child.tag for child in node.children if isinstance(child, _Node)]
+        shape = {"tag": node.tag if node.tag in safe_tags else "other",
+                 "classes": sorted(classes & marker_classes),
+                 "class_count": len(classes), "unrecognized_class_count": len(classes - marker_classes),
+                 "element_child_count": len(child_tags),
+                 "element_child_tags": [tag if tag in safe_tags else "other" for tag in child_tags[:10]],
+                 "direct_cell_child": node.parent is cell}
+        text = " ".join(_submission_cell_text(node).split())
+        if text in labels:
+            shape["status_label"] = text
+        return shape
+
+    tables = [node for node in tree.walk() if node.tag == "table"]
+    evidence = []
+    for table_index, table in enumerate(tables[:10]):
+        rows = []
+        for node in table.walk():
+            if node.tag != "tr":
                 continue
-            statuses.append(" ".join(cells[status_index].text().split())[:120])
-    return statuses
+            parent = node.parent
+            while parent and parent.tag != "table":
+                parent = parent.parent
+            if parent is table:
+                rows.append(node)
+        row_evidence = []
+        for row_index, row in enumerate(rows[:50]):
+            cells = [child for child in row.children if isinstance(child, _Node) and child.tag in {"th", "td"}]
+            item = {"row": row_index, "cell_count": len(cells), "cell_tags": [cell.tag for cell in cells[:20]],
+                    "explicitly_hidden": _explicitly_hidden(row), "metadata_cells": []}
+            for column, cell in enumerate(cells[:20]):
+                text = " ".join(_submission_cell_text(cell).split())
+                info = {"column": column, "tag": cell.tag}
+                direct_elements = [element_shape(child, cell) for child in cell.children if isinstance(child, _Node)]
+                if direct_elements:
+                    info["direct_element_nodes"] = direct_elements[:15]
+                if re.fullmatch(r"\d{1,3}[.．、]", text):
+                    info["numbered_label"] = int(text[:-1])
+                if text in {"提交状态", "题目", "题号", "#"}:
+                    info["header_label"] = text
+                found_labels = [label for label in labels if label in text]
+                if found_labels:
+                    info["status_labels"] = found_labels
+                markers = []
+                for marker in cell.walk():
+                    if marker.tag not in marker_tags:
+                        continue
+                    ancestor, admissible = marker, True
+                    while ancestor is not cell:
+                        if ancestor.tag in {"table", "script", "style", "input", "textarea", "select", "option", "pre", "code", "a", "button"}:
+                            admissible = False
+                            break
+                        ancestor = ancestor.parent
+                    marker_text = " ".join(_submission_cell_text(marker).split())
+                    if admissible and marker_text in labels:
+                        prior = []
+                        if marker.parent:
+                            for sibling in marker.parent.children:
+                                if sibling is marker:
+                                    break
+                                prior.append(_submission_cell_text(sibling) if isinstance(sibling, _Node) else sibling)
+                        markers.append({**element_shape(marker, cell),
+                                        "parent_tag": marker.parent.tag if marker.parent and marker.parent.tag in marker_tags | {"tr", "li", "section"} else "other",
+                                        "submission_label_adjacent": bool(re.search(r"提交状态\s*[:：]\s*$", " ".join(prior)))})
+                if markers:
+                    info["exact_status_nodes"] = markers[:10]
+                for field, label in date_labels.items():
+                    dates = [_datetime(match.group(1)) for match in re.finditer(re.escape(label) + r"\s*[:：]\s*(" + _DATE.pattern + ")", text)]
+                    if dates:
+                        info[field] = list(dict.fromkeys(value for value in dates if value))[:5]
+                if len(info) > 2:
+                    item["metadata_cells"].append(info)
+            row_evidence.append(item)
+        evidence.append({"table": table_index, "row_count": len(rows), "rows": row_evidence, "rows_truncated": len(rows) > 50})
+    return {"table_count": len(tables), "tables": evidence, "tables_truncated": len(tables) > 10,
+            "recognized_summary": _submission_summary(tree)}
 
 
 def _submission_summary(tree):
     states = []
     for status in _submission_statuses(tree):
-        if any(word in status for word in ("未提交", "未完成", "尚未提交", "无提交")):
+        words = status.split()
+        pending = any(word in _PENDING_LABELS for word in words)
+        submitted = any(word in _SUBMITTED_LABELS for word in words)
+        if pending and submitted:
+            states.append("unverified")
+        elif pending:
             states.append("pending")
-        elif any(word in status for word in ("已提交", "已完成", "已评阅", "已批阅", "已批改")):
+        elif submitted:
             states.append("submitted")
         elif any(_datetime(match.group(1)) for match in re.finditer(r"初次提交时间\s*[:：]\s*(" + _DATE.pattern + ")", status)):
             states.append("submitted")
@@ -604,23 +1000,26 @@ def _assignment_detail(tree, entry, course, course_id, warnings):
 
 
 def collect_xiji(context, course_scope=COURSE_SCOPE):
-    """Read configured courses and restore the initial course selection."""
+    """Read configured courses and restore the initial selection when known."""
     course_scope = tuple(name.strip() for name in course_scope if isinstance(name, str) and name.strip())
     reader = _Reader(context)
     candidates, warnings = [], []
     auth = {"authenticated": False, "status": "unverified", "message": "尚未检查", "signals": []}
     coverage = {"courses_in_scope": list(course_scope), "current_course_identified": False,
+                "initial_course_identified": False,
                 "course_lists_read": 0, "assignment_links_found": 0, "assignment_candidates": 0,
-                "assignment_details_read": 0, "courses_completed": [], "disabled": not course_scope, "complete": False}
+                "assignment_details_read": 0, "assignment_statuses_verified": 0, "assignment_statuses_unverified": 0,
+                "courses_completed": [], "disabled": not course_scope, "complete": False}
     controls, course_contexts, list_structure, main_hints, list_hints = [], [], {}, {}, {}
     structures, original, initial_main, switched = {}, None, None, False
+    submission_evidence = {}
     if not course_scope:
         coverage["complete"] = True
         auth.update(status="disabled", message="未设置希冀课程，已跳过采集")
         return {"candidates": [], "warnings": [], "auth": auth,
                 "diagnostics": {**reader.diagnostics(), "coverage": coverage}}
     try:
-        auth, main = _probe(reader)
+        auth, main = _probe_with_campus_session(reader)
         initial_main = main
         courses = []
         controls = _course_controls(main, course_scope)
@@ -634,6 +1033,8 @@ def collect_xiji(context, course_scope=COURSE_SCOPE):
             all_courses = _course_entries(main, None)
             original = next((entry for entry in all_courses if entry["current"]), None)
             courses = [entry for entry in all_courses if _scoped(entry["name"], course_scope)]
+            if len(_current_course_names(main, course_scope)) > 1:
+                raise _ReadError("希冀主页出现相互冲突的当前课程名称，未执行课程切换")
             course = original["name"] if original and courses else _current_course(main, course_scope)
             frame_course = _frame_course(context, course_scope)
             if not course:
@@ -645,27 +1046,38 @@ def collect_xiji(context, course_scope=COURSE_SCOPE):
                 # already-loaded browser frame can still show a previous one.
                 coverage["course_name_source"] = "selected_course_dropdown"
             elif frame_course and frame_course != course:
-                course = ""
-                warnings.append("希冀主页与已加载课程框架的课程名存在冲突，暂不导入，请打开目标课程后重试")
+                raise _ReadError("希冀主页与已加载课程框架的课程名存在冲突，暂不导入，请打开目标课程后重试")
             coverage["current_course_identified"] = bool(course)
-            if not course:
+            coverage["initial_course_identified"] = bool(course)
+            if not original and course:
+                original = next((entry for entry in all_courses if entry["name"] == course), None)
+            if not course and not courses:
                 warnings.append("希冀主页未识别到唯一且明确的当前课程名称，暂不导入，请核对课程范围及当前课程")
             else:
                 if not courses:
                     courses = [{"id": "", "name": course, "current": True}]
+                active_id = original["id"] if original else ""
                 if len(courses) > 4:
                     warnings.append("希冀匹配课程超过4门，本次按请求上限仅核对前4门，其余课程仍需人工核对")
                 for target in courses[:4]:
                     try:
                         course_main = main
-                        if not target["current"]:
-                            if not original:
-                                warnings.append("未能确认希冀初始课程ID，未执行课程切换")
-                                continue
+                        if target["id"] and target["id"] != active_id:
+                            # A renewed platform session can be authenticated
+                            # without a selected course. Select an observed,
+                            # configured numeric option through the verified
+                            # navigation form instead of guessing a default.
                             switched = True
                             course_main = reader.select_course(target["id"], initial_main)
-                            if _current_course(course_main, course_scope) != target["name"]:
+                            returned_courses = _course_entries(course_main, None)
+                            if (_current_course(course_main, None) != target["name"]
+                                    or not any(entry["id"] == target["id"] and entry["name"] == target["name"]
+                                               for entry in returned_courses)):
                                 raise _ReadError("希冀课程切换结果未确认，已停止读取该课程")
+                            active_id = target["id"]
+                            coverage["current_course_identified"] = True
+                            if not coverage["initial_course_identified"]:
+                                coverage["course_name_source"] = "verified_course_selection"
                         navigation = _navigation(course_main)
                         if "在线作业" not in navigation:
                             raise _ReadError("希冀当前课程未提供已验证的在线作业导航")
@@ -687,10 +1099,19 @@ def collect_xiji(context, course_scope=COURSE_SCOPE):
                                 warnings.append(target["name"] + "：作业详情课程名不一致，已跳过")
                                 continue
                             coverage["assignment_details_read"] += 1
+                            evidence = _submission_evidence(detail)
+                            submission_evidence["course:" + target["id"] + ":assignment:" + entry["id"]] = evidence
                             candidate = _assignment_detail(detail, entry, target["name"], target["id"], warnings)
                             if candidate:
                                 candidates.append(candidate)
-                                successful += 1
+                                summary = evidence["recognized_summary"]
+                                if summary and not summary.get("unverified", 0):
+                                    coverage["assignment_statuses_verified"] += 1
+                                    successful += 1
+                                else:
+                                    coverage["assignment_statuses_unverified"] += 1
+                                    warnings.append(target["name"] + "：" + entry["title"][:60]
+                                                    + "的提交状态尚未确认，已保留截止时间；本课程未计为完整核对，无需因此重新登录")
                         if not entries:
                             candidates.extend(_assignments(listing, target["name"], warnings, course_scope))
                         if entries and successful == len(entries) or list_structure["explicit_empty"]:
@@ -729,10 +1150,16 @@ def collect_xiji(context, course_scope=COURSE_SCOPE):
                 warnings.append("希冀初始课程恢复失败，请在平台重新选择原课程")
             reader.count += restore.count
             reader.routes.extend(restore.routes)
+        elif switched and reader.navigation_attempted and not original:
+            # No initial choice was established. Do not invent an ID to
+            # restore, or mislabel successfully read courses as incomplete.
+            coverage["initial_course_restored"] = None
+            coverage["initial_course_restore_reason"] = "initial_course_not_identified"
     unique = {item["source_key"]: item for item in candidates}
     coverage["assignment_candidates"] = len(unique)
     return {"candidates": list(unique.values()), "warnings": list(dict.fromkeys(warnings)), "auth": auth,
             "diagnostics": {**reader.diagnostics(), "coverage": coverage, "course_controls": controls,
                             "course_contexts": course_contexts, "assignment_list_structure": list_structure,
                             "assignment_structures_by_course": structures,
+                            "assignment_submission_evidence": submission_evidence,
                             "main_page_hints": main_hints, "assignment_page_hints": list_hints}}

@@ -3,10 +3,10 @@ import json
 import hashlib
 import unittest
 from unittest.mock import patch
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from studyreminder.chaoxing_adapter import (
-    _Reader, _Tree, _confirmed_work_dates, _dates, _exam_rows, _node_params, _safe_url,
+    _Reader, _Tree, _confirmed_work_dates, _dates, _exam_rows, _exam_status_options, _node_params, _safe_url,
     collect_chaoxing, probe_chaoxing_auth,
 )
 
@@ -56,6 +56,26 @@ class Request:
 class Context:
     def __init__(self, overrides=None):
         self.request = Request(overrides)
+
+
+class FilteredExamContext(Context):
+    def __init__(self, default_body, completed_response, awaiting_response=None):
+        super().__init__({"/exam-ans/exam/test/examcode/examlist": Response(default_body)})
+        original_get = self.request.get
+
+        def get(url, **kwargs):
+            query = parse_qs(urlparse(url).query)
+            if urlparse(url).path == "/exam-ans/exam/test/examcode/examlist" and query in ({"status": ["3"]}, {"status": ["4"]}):
+                self.request.calls.append((url, kwargs))
+                response = completed_response if query == {"status": ["3"]} else awaiting_response
+                if isinstance(response, Exception):
+                    raise response
+                if response is None:
+                    raise AssertionError("unexpected filtered list")
+                return response
+            return original_get(url, **kwargs)
+
+        self.request.get = get
 
 
 class AdapterTests(unittest.TestCase):
@@ -387,6 +407,270 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(exam["status"], "completed")
         self.assertEqual(update["status"], "completed")
         self.assertEqual(update["status_evidence"], "已完成")
+
+    def test_exam_handed_in_and_marking_states_complete_while_exam_is_still_open(self):
+        for state in ("已交卷", "已提交", "待批阅", "已批阅", "待评阅", "已评阅"):
+            with self.subTest(state=state):
+                body = '<tr class="dataTr"><td>1</td><td><a href="?examId=7&amp;courseId=11">大物测验</a></td>' \
+                       '<td>2026-10-20 10:00 至 2026-10-20 12:00</td><td>120</td><td>进行中</td><td>' \
+                       + state + '</td><td>待公布</td></tr>'
+                context = Context({"/exam-ans/exam/test/examcode/examlist": Response(body)})
+                result = collect_chaoxing(context, homework_courses=[])
+                self.assertEqual(result["candidates"][0]["status"], "completed")
+                self.assertEqual(result["status_updates"], [{
+                    "source": "chaoxing", "source_key": "course:11:exam:7", "status": "completed",
+                    "status_evidence": state,
+                }])
+                self.assertTrue(result["diagnostics"]["coverage"]["complete"])
+                self.assertFalse(any("/exam/" in url and "examlist" not in url for url, _ in context.request.calls))
+
+    def test_exam_availability_and_other_columns_never_complete_unknown_response(self):
+        for availability, response, other in (("已结束", "", ""), ("进行中", "", ""),
+                                               ("已完成", "", ""), ("已发布", "", "已完成"),
+                                               ("已结束", "查看已完成考试", "")):
+            with self.subTest(availability=availability, response=response, other=other):
+                body = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+                       '<td>2026-10-20 10:00 至 2026-10-20 12:00</td><td>120</td><td>' + availability \
+                       + '</td><td>' + response + '</td><td>' + other + '</td></tr>'
+                result = collect_chaoxing(Context({"/exam-ans/exam/test/examcode/examlist": Response(body)}),
+                                          homework_courses=[])
+                self.assertEqual(result["status_updates"], [])
+                self.assertEqual(result["candidates"][0]["status"], "pending")
+                self.assertIn("平台提交状态未能可靠确认", result["candidates"][0]["notes"])
+                self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+
+    def test_exam_status_diagnostics_only_store_known_labels_and_column_indexes(self):
+        body = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+               '<td>2026-10-20 10:00 至 2026-10-20 12:00</td><td>120</td><td>进行中</td>' \
+               '<td><span>已交卷</span><a href="/exam/start?token=PRIVATE_TOKEN">查看PRIVATE_ACTION</a>' \
+               '<script>PRIVATE_SCRIPT</script><input name="private" value="PRIVATE_VALUE"></td><td>PRIVATE_SCORE</td></tr>'
+        result = collect_chaoxing(Context({"/exam-ans/exam/test/examcode/examlist": Response(body)}),
+                                  homework_courses=[])
+        evidence = result["diagnostics"]["exam_status_evidence"]
+        self.assertEqual(evidence, [{
+            "source_key": "course:11:exam:7", "response_column": 5,
+            "status_cells": [{"index": 4, "labels": ["进行中"]}, {"index": 5, "labels": ["已交卷"]},
+                             {"index": 6, "labels": []}], "recognized_status": "completed",
+        }])
+        self.assertNotIn("PRIVATE", json.dumps(evidence))
+        self.assertEqual(result["status_updates"][0]["status_evidence"], "已交卷")
+
+    def test_exam_contradictory_response_labels_do_not_complete(self):
+        for response in ("已交卷 未交卷", "<span>已提交</span><span>未作答</span>"):
+            with self.subTest(response=response):
+                body = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+                       '<td>2026-10-20 10:00 至 2026-10-20 12:00</td><td>120</td><td>进行中</td><td>' \
+                       + response + '</td></tr>'
+                result = collect_chaoxing(Context({"/exam-ans/exam/test/examcode/examlist": Response(body)}),
+                                          homework_courses=[])
+                self.assertEqual(result["status_updates"], [])
+                self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+
+    def test_exam_returned_or_withdrawn_submission_stays_pending(self):
+        for response in ("已交卷 已退回", "<span>已提交</span><span>需重交</span>"):
+            with self.subTest(response=response):
+                body = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+                       '<td>2026-10-20 10:00 至 2026-10-20 12:00</td><td>120</td><td>进行中</td><td>' \
+                       + response + '</td></tr>'
+                result = collect_chaoxing(Context({"/exam-ans/exam/test/examcode/examlist": Response(body)}),
+                                          homework_courses=[])
+                self.assertEqual(result["status_updates"][0]["status"], "pending")
+                self.assertEqual(result["candidates"][0]["status"], "pending")
+
+    def test_handed_in_exam_without_deadline_still_updates_exact_platform_identity(self):
+        body = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+               '<td>时间已隐藏</td><td>120</td><td>已结束</td><td>已交卷</td></tr>'
+        result = collect_chaoxing(Context({"/exam-ans/exam/test/examcode/examlist": Response(body)}),
+                                  homework_courses=[])
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(result["status_updates"], [{"source": "chaoxing", "source_key": "course:11:exam:7",
+                                                    "status": "completed", "status_evidence": "已交卷"}])
+        self.assertTrue(result["diagnostics"]["coverage"]["complete"])
+
+    def test_exam_list_tab_diagnostics_are_redacted_and_do_not_follow_navigation(self):
+        body = '<nav><a class="active" href="/exam-ans/exam/test/examcode/examlist?status=0&amp;uid=PRIVATE_UID">待考 (2)</a>' \
+               '<a href="/exam-ans/exam/test/examcode/examlist?status=1&amp;pageNum=1&amp;token=PRIVATE_TOKEN&amp;enc=PRIVATE_ENC">已完成</a>' \
+               '<a href="https://other.invalid/PRIVATE_PATH?status=1">已交卷</a>' \
+               '<a href="/exam/start?token=PRIVATE_TOKEN">已参加</a>' \
+               '<a onclick="PRIVATE_FUNCTION(1, &quot;PRIVATE_TOKEN&quot;, 1234567890)">未考</a>' \
+               '<li data-status="2" data-token="PRIVATE_TOKEN"><a href="javascript:PRIVATE_FUNCTION(2)">已考</a></li>' \
+               '<select name="examStatus"><option selected value="2">已结束</option></select>' \
+               '<a href="/exam-ans/exam/test/examcode/examlist?status=PRIVATE_STATE&amp;PRIVATE_FIELD=1">全部</a></nav><p>暂无考试</p>'
+        context = Context({"/exam-ans/exam/test/examcode/examlist": Response(body)})
+        result = collect_chaoxing(context, homework_courses=[])
+        navigation = result["diagnostics"]["exam_list_navigation"]
+        self.assertEqual(navigation[0], {"label": "待考", "tag": "a", "selected": True,
+                                        "path": "/exam-ans/exam/test/examcode/examlist",
+                                        "query_fields": ["status"], "numeric_options": {"status": "0"}})
+        completed = next(item for item in navigation if item["label"] == "已完成")
+        self.assertEqual(completed["numeric_options"], {"status": "1", "pageNum": "1"})
+        self.assertEqual(next(item for item in navigation if item["label"] == "已交卷")["target"], "other_route")
+        self.assertEqual(next(item for item in navigation if item["label"] == "已参加")["target"], "other_route")
+        self.assertEqual(next(item for item in navigation if item["label"] == "未考")["onclick_calls"],
+                         [{"argument_count": 3, "numeric_arguments": [{"position": 1, "value": "1"}]}])
+        self.assertEqual(next(item for item in navigation if item["label"] == "已结束")["numeric_option"], "2")
+        self.assertEqual(next(item for item in navigation if item["label"] == "已考" and item["tag"] == "li")["numeric_attributes"],
+                         {"data-status": "2"})
+        self.assertEqual(next(item for item in navigation if item["label"] == "已考" and item["tag"] == "a")["onclick_calls"],
+                         [{"argument_count": 1, "numeric_arguments": [{"position": 1, "value": "2"}]}])
+        self.assertNotIn("PRIVATE", json.dumps(navigation))
+        self.assertEqual(len(context.request.calls), 2)
+
+    def test_exam_state_labels_inside_exam_rows_are_not_reported_as_tabs(self):
+        result = collect_chaoxing(Context(), homework_courses=[])
+        self.assertEqual(result["diagnostics"]["exam_list_navigation"], [])
+
+    def test_all_observed_status_options_have_only_fixed_words_and_short_integer_values(self):
+        body = '<select name="status"><option value="" selected>全部</option>' \
+               '<option value="1">PRIVATE_PREFIX 考试进行中（3）</option><option value="2">未交卷</option>' \
+               '<option value="4">待批阅</option><option value="5">PRIVATE_LABEL</option>' \
+               '<option value="PRIVATE_VALUE">PRIVATE_LABEL</option></select>' \
+               '<select name="PRIVATE_FIELD"><option value="6">已交卷</option></select>'
+        options = _exam_status_options(_Tree(body).root)
+        self.assertEqual(options, [
+            {"selected": True, "label_exact": "全部", "state_tokens": ["全部"], "value_kind": "empty"},
+            {"selected": False, "label_exact": "unknown", "state_tokens": ["进行中"], "numeric_option": "1"},
+            {"selected": False, "label_exact": "未交卷", "state_tokens": ["未交卷"], "numeric_option": "2"},
+            {"selected": False, "label_exact": "待批阅", "state_tokens": ["待批阅"], "numeric_option": "4"},
+            {"selected": False, "label_exact": "unknown", "state_tokens": [], "numeric_option": "5"},
+            {"selected": False, "label_exact": "unknown", "state_tokens": [], "value_kind": "other"},
+        ])
+        self.assertNotIn("PRIVATE", json.dumps(options))
+
+    def test_observed_completed_exam_option_reads_one_list_and_preserves_fingerprint(self):
+        selector = '<select name="status"><option>全部</option><option value="3">已完成</option></select>'
+        row = '<tr class="dataTr"><td>1</td><td>2026年秋季大物B磁学单元测验</td>' \
+              '<td>2026-10-17 10:00 至 2026-10-18 16:20</td><td>120</td><td>已结束</td><td>已交卷</td></tr>'
+        previous = _exam_rows(_Tree(row.replace("已交卷", "未作答")).root, [], ["大物"])[0]
+        context = FilteredExamContext(selector + '<p>暂无考试</p>', Response(selector + row))
+        result = collect_chaoxing(context, homework_courses=[])
+        self.assertEqual(result["candidates"][0]["source_key"], previous["source_key"])
+        self.assertEqual(result["status_updates"], [{"source": "chaoxing", "source_key": previous["source_key"],
+                                                    "status": "completed", "status_evidence": "已交卷"}])
+        self.assertEqual(result["diagnostics"]["exam_status_evidence"][0]["list_filter"], "completed")
+        coverage = result["diagnostics"]["coverage"]
+        self.assertTrue(coverage["exam_completed_list_available"])
+        self.assertEqual(coverage["exam_completed_lists_read"], 1)
+        self.assertTrue(coverage["exam_completed_list_recognized"])
+        self.assertTrue(coverage["complete"])
+        self.assertEqual(len(context.request.calls), 3)
+        self.assertEqual(parse_qs(urlparse(context.request.calls[-1][0]).query), {"status": ["3"]})
+
+    def test_completed_filter_never_implies_personal_submission(self):
+        selector = '<select name="status"><option value="3">已完成</option></select>'
+        for response in ("", "查看已完成考试"):
+            with self.subTest(response=response):
+                row = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+                      '<td>2026-10-17 10:00 至 2026-10-18 16:20</td><td>120</td><td>已结束</td><td>' + response + '</td></tr>'
+                context = FilteredExamContext(selector + '<p>暂无考试</p>', Response(row))
+                result = collect_chaoxing(context, homework_courses=[])
+                self.assertEqual(result["status_updates"], [])
+                self.assertEqual(result["candidates"][0]["status"], "pending")
+                self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+
+    def test_failed_or_unrecognized_completed_list_keeps_default_submission_but_not_complete_coverage(self):
+        selector = '<select name="status"><option value="3">已完成</option></select>'
+        row = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+              '<td>2026-10-17 10:00 至 2026-10-18 16:20</td><td>120</td><td>已结束</td><td>已完成</td></tr>'
+        for response in (Response(status=500), Response('<main>layout changed</main>')):
+            with self.subTest(status=response.status, body=response.body):
+                context = FilteredExamContext(selector + row, response)
+                result = collect_chaoxing(context, homework_courses=[])
+                self.assertEqual(result["status_updates"][0]["status"], "completed")
+                self.assertTrue(result["diagnostics"]["coverage"]["exam_list_recognized"])
+                self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+                self.assertEqual(len(context.request.calls), 3)
+
+    def test_completed_list_selector_is_not_guessed_from_other_fields_values_or_labels(self):
+        for field, value, label in (("examStatus", "3", "已完成"), ("status", "2", "已完成"),
+                                     ("status", "3", "已结束")):
+            with self.subTest(field=field, value=value, label=label):
+                selector = '<select name="' + field + '"><option value="' + value + '">' + label + '</option></select>'
+                context = FilteredExamContext(selector + '<p>暂无考试</p>', RuntimeError("must not request"))
+                result = collect_chaoxing(context, homework_courses=[])
+                self.assertFalse(result["diagnostics"]["coverage"]["exam_completed_list_available"])
+                self.assertEqual(len(context.request.calls), 2)
+
+    def test_submission_conflicts_between_default_and_completed_lists_are_not_overwritten(self):
+        selector = '<select name="status"><option value="3">已完成</option></select>'
+        row = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+              '<td>2026-10-17 10:00 至 2026-10-18 16:20</td><td>120</td><td>已结束</td><td>未作答</td></tr>'
+        context = FilteredExamContext(selector + row, Response(row.replace("未作答", "已交卷")))
+        result = collect_chaoxing(context, homework_courses=[])
+        self.assertEqual(result["status_updates"], [])
+        self.assertEqual(result["candidates"], [])
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+
+    def test_deadline_conflicts_between_exam_lists_do_not_override_identity(self):
+        selector = '<select name="status"><option value="3">已完成</option></select>'
+        row = '<tr class="dataTr"><td>1</td><td>大物测验</td>' \
+              '<td>2026-10-17 10:00 至 2026-10-18 16:20</td><td>120</td><td>已结束</td><td>已交卷</td></tr>'
+        context = FilteredExamContext(selector + row, Response(row.replace("2026-10-18 16:20", "2026-10-19 16:20")))
+        result = collect_chaoxing(context, homework_courses=[])
+        self.assertEqual(result["status_updates"], [])
+        self.assertEqual(result["candidates"], [])
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+        self.assertTrue(any("列表之间的截止时间" in warning for warning in result["warnings"]))
+
+    def test_observed_awaiting_review_list_reads_once_and_requires_personal_submission(self):
+        selector = '<select name="status"><option value="4">待批阅</option></select>'
+        row = '<tr class="dataTr"><td>1</td><td>2026年秋季大物B磁学单元测验</td>' \
+              '<td>2026-10-17 10:00 至 2026-10-18 16:20</td><td>120</td><td>已结束</td><td>待批阅</td></tr>'
+        previous = _exam_rows(_Tree(row.replace('待批阅</td>', '未作答</td>')).root, [], ["大物"])[0]
+        context = FilteredExamContext(selector + '<p>暂无考试</p>', None, Response(row))
+        result = collect_chaoxing(context, homework_courses=[])
+        self.assertEqual(result["status_updates"], [{"source": "chaoxing", "source_key": previous["source_key"],
+                                                    "status": "completed", "status_evidence": "待批阅"}])
+        self.assertEqual(result["diagnostics"]["exam_status_evidence"][0]["list_filter"], "awaiting_review")
+        coverage = result["diagnostics"]["coverage"]
+        self.assertTrue(coverage["exam_awaiting_review_list_available"])
+        self.assertEqual(coverage["exam_awaiting_review_lists_read"], 1)
+        self.assertTrue(coverage["exam_awaiting_review_list_recognized"])
+        self.assertTrue(coverage["complete"])
+        self.assertEqual(len(context.request.calls), 3)
+        self.assertEqual(parse_qs(urlparse(context.request.calls[-1][0]).query), {"status": ["4"]})
+
+    def test_awaiting_review_filter_does_not_complete_missing_personal_status(self):
+        selector = '<select name="status"><option value="4">待批阅</option></select>'
+        row = '<tr class="dataTr"><td>1</td><td>大物测验</td>' \
+              '<td>2026-10-17 10:00 至 2026-10-18 16:20</td><td>120</td><td>已结束</td><td></td></tr>'
+        context = FilteredExamContext(selector + '<p>暂无考试</p>', None, Response(row))
+        result = collect_chaoxing(context, homework_courses=[])
+        self.assertEqual(result["status_updates"], [])
+        self.assertEqual(result["candidates"][0]["status"], "pending")
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+
+    def test_awaiting_review_selector_is_not_guessed(self):
+        for field, value, label in (("examStatus", "4", "待批阅"), ("status", "2", "待批阅"),
+                                     ("status", "4", "已结束")):
+            with self.subTest(field=field, value=value, label=label):
+                selector = '<select name="' + field + '"><option value="' + value + '">' + label + '</option></select>'
+                context = FilteredExamContext(selector + '<p>暂无考试</p>', None)
+                result = collect_chaoxing(context, homework_courses=[])
+                self.assertFalse(result["diagnostics"]["coverage"]["exam_awaiting_review_list_available"])
+                self.assertEqual(len(context.request.calls), 2)
+
+    def test_failure_of_completed_list_does_not_starve_observed_awaiting_review_list(self):
+        selector = '<select name="status"><option value="3">已完成</option><option value="4">待批阅</option></select>'
+        row = '<tr class="dataTr" data-examid="7" data-courseid="11"><td>1</td><td>大物测验</td>' \
+              '<td>2026-10-17 10:00 至 2026-10-18 16:20</td><td>120</td><td>已结束</td><td>待批阅</td></tr>'
+        context = FilteredExamContext(selector + '<p>暂无考试</p>', Response(status=500), Response(row))
+        result = collect_chaoxing(context, homework_courses=[])
+        self.assertEqual(result["status_updates"][0]["status"], "completed")
+        self.assertEqual(result["diagnostics"]["coverage"]["exam_awaiting_review_lists_read"], 1)
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+        self.assertEqual(len(context.request.calls), 4)
+        self.assertEqual([parse_qs(urlparse(url).query) for url, _ in context.request.calls[2:]],
+                         [{"status": ["3"]}, {"status": ["4"]}])
+
+    def test_unrecognized_awaiting_review_list_leaves_coverage_incomplete(self):
+        selector = '<select name="status"><option value="4">待批阅</option></select>'
+        for response in (Response(status=500), Response('<main>layout changed</main>')):
+            with self.subTest(status=response.status):
+                result = collect_chaoxing(FilteredExamContext(selector + '<p>暂无考试</p>', None, response),
+                                          homework_courses=[])
+                self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+                self.assertFalse(result["diagnostics"]["coverage"]["exam_awaiting_review_list_recognized"])
 
     def test_confirmed_year_is_explicit_bound_and_preserves_platform_range(self):
         body = '<p>作答时间:10-14 12:15 至 10-21 09:50</p>'

@@ -13,6 +13,9 @@ private let reminderOffsets: [TimeInterval] = [-172_800, -86_400, -7_200]
 private struct SyncInput: Decodable {
     let tasks: [TaskInput]
     let calendar: CalendarInput?
+    let platform_synced_at: String?
+    let platform_sync_attempted_at: String?
+    let platform_sync_result: String?
 }
 
 private struct CalendarInput: Decodable {
@@ -26,6 +29,7 @@ private struct TaskInput: Decodable {
     let title: String
     let course: String?
     let due_at: String
+    let source: String?
     let kind: String?
     let start_at: String?
     let status: String?
@@ -38,6 +42,9 @@ private struct PreparedTask {
     let id: String
     let title: String
     let due: Date
+    let eventStart: Date
+    let eventEnd: Date
+    let offsets: [TimeInterval]
     let notes: String
     let marker: URL
     let pending: Bool
@@ -133,20 +140,48 @@ private func prepare(_ input: SyncInput) throws -> [PreparedTask] {
         guard let due = parseDate(task.due_at) else {
             throw fail("截止时间格式无效：\(task.id) / \(task.due_at)")
         }
-        var lines = ["截止时间：\(displayDate(due))"]
+        let lecture = task.kind == "lecture"
+        var lines = ["\(lecture ? "上课时间" : "截止时间")：\(displayDate(due))"]
+        if lecture {
+            lines.append("仅记录开课时间；日历事件时长为提醒占位，不代表课长。")
+        }
+        var examStart: Date?
         if let start = task.start_at, !start.isEmpty {
             guard let date = parseDate(start) else {
                 throw fail("考试开始时间格式无效：\(task.id) / \(start)")
             }
-            lines.append("考试开始：\(displayDate(date))")
+            if task.kind == "exam" { examStart = date }
+            if !lecture { lines.append("考试开始：\(displayDate(date))") }
         }
+        // A personally entered exam has a known sitting time. Platform exams
+        // can expose a broad availability window, so keep their deadline anchor.
+        let timedExam = task.source == "manual" && task.kind == "exam" &&
+            examStart.map { $0 < due } == true
+        let eventStart = timedExam ? examStart! : due
+        let eventEnd = timedExam ? due : due.addingTimeInterval(900)
+        // EventKit offsets are relative to eventStart. Keep alerts at exactly
+        // deadline - 48h/24h/2h even when the visible event starts earlier.
+        let offsets = reminderOffsets.map { due.timeIntervalSince(eventStart) + $0 }
         if let course = task.course, !course.isEmpty { lines.append("课程：\(course)") }
         if let kind = task.kind, !kind.isEmpty { lines.append("类型：\(kind)") }
+        if let synced = input.platform_synced_at, !synced.isEmpty {
+            guard parseDate(synced) != nil else { throw fail("平台同步时间格式无效，未执行同步。") }
+            lines.append("平台最近成功同步：\(synced)")
+        }
+        if let attempted = input.platform_sync_attempted_at, !attempted.isEmpty {
+            guard parseDate(attempted) != nil else { throw fail("平台尝试时间格式无效，未执行同步。") }
+            lines.append("平台最近尝试同步：\(attempted)")
+            let allowed: Set<String> = ["never", "running", "success", "partial", "failed", "scope_changed", "interrupted"]
+            if let result = input.platform_sync_result, allowed.contains(result) {
+                lines.append("平台同步结果：\(result)")
+            }
+        }
         if let url = task.url, !url.isEmpty { lines.append("原始页面：\(url)") }
         if let notes = task.notes, !notes.isEmpty { lines.append("\n\(notes)") }
         if let updated = task.updated_at, !updated.isEmpty { lines.append("\n本地记录更新时间：\(updated)") }
         let title = task.course.flatMap { $0.isEmpty ? nil : "\($0) · \(task.title)" } ?? task.title
         return PreparedTask(id: task.id, title: title, due: due,
+                            eventStart: eventStart, eventEnd: eventEnd, offsets: offsets,
                             notes: lines.joined(separator: "\n"),
                             marker: try markerURL(for: task.id), pending: status == "pending")
     }
@@ -196,8 +231,8 @@ private func ownedEvents(_ store: EKEventStore, calendar: EKCalendar, tasks: [Pr
     var cursor = gregorian.date(byAdding: .year, value: -2, to: now)!
     var upper = gregorian.date(byAdding: .year, value: 2, to: now)!
     for task in tasks {
-        cursor = min(cursor, task.due.addingTimeInterval(-86_400))
-        upper = max(upper, task.due.addingTimeInterval(86_400))
+        cursor = min(cursor, task.eventStart.addingTimeInterval(-86_400))
+        upper = max(upper, task.eventEnd.addingTimeInterval(86_400))
     }
     var found: [EKEvent] = []
     var seen = Set<String>()
@@ -224,9 +259,9 @@ private func ownedEvents(_ store: EKEventStore, calendar: EKCalendar, tasks: [Pr
 private func eventNeedsUpdate(_ event: EKEvent, task: PreparedTask) -> Bool {
     let offsets = (event.alarms ?? []).filter { $0.absoluteDate == nil }.map(\.relativeOffset).sorted()
     return event.title != task.title || event.notes != task.notes || event.url != task.marker ||
-        event.startDate != task.due || event.endDate != task.due.addingTimeInterval(900) ||
+        event.startDate != task.eventStart || event.endDate != task.eventEnd ||
         event.isAllDay || event.timeZone?.identifier != studyTimeZone.identifier ||
-        event.hasRecurrenceRules || (event.alarms ?? []).count != reminderOffsets.count || offsets != reminderOffsets.sorted()
+        event.hasRecurrenceRules || (event.alarms ?? []).count != task.offsets.count || offsets != task.offsets.sorted()
 }
 
 private func configure(_ event: EKEvent, task: PreparedTask, calendar: EKCalendar) {
@@ -234,14 +269,12 @@ private func configure(_ event: EKEvent, task: PreparedTask, calendar: EKCalenda
     event.title = task.title
     event.notes = task.notes
     event.url = task.marker
-    // DDL is deliberately DTSTART: both alarm offsets are relative to DDL,
-    // even for an exam that has a different start_at in its notes.
-    event.startDate = task.due
-    event.endDate = task.due.addingTimeInterval(900)
+    event.startDate = task.eventStart
+    event.endDate = task.eventEnd
     event.timeZone = studyTimeZone
     event.isAllDay = false
     event.recurrenceRules = nil
-    event.alarms = reminderOffsets.map { EKAlarm(relativeOffset: $0) }
+    event.alarms = task.offsets.map { EKAlarm(relativeOffset: $0) }
     event.availability = .free
 }
 
@@ -366,6 +399,23 @@ private struct CalendarBridge {
             guard data.count <= 5_000_000 else { throw fail("输入超过 5 MB，未同步。") }
             let input = try JSONDecoder().decode(SyncInput.self, from: data)
             let tasks = try prepare(input)
+            // Pure preparation diagnostic: never creates an event store or
+            // requests access, and is safe for offline scheduling tests.
+            if CommandLine.arguments.dropFirst().contains("--preview") {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                let preview: [[String: Any]] = tasks.map { task in
+                    ["id": task.id, "event_start": formatter.string(from: task.eventStart),
+                     "event_end": formatter.string(from: task.eventEnd),
+                     "reminder_offsets": task.offsets,
+                     "reminder_at": task.offsets.map { formatter.string(from: task.eventStart.addingTimeInterval($0)) },
+                     "notes": task.notes]
+                }
+                let result = try JSONSerialization.data(withJSONObject: ["ok": true, "tasks": preview], options: [.sortedKeys])
+                FileHandle.standardOutput.write(result)
+                FileHandle.standardOutput.write(Data([10]))
+                return
+            }
             _ = NSApplication.shared
             NSApplication.shared.setActivationPolicy(.accessory)
             let store = EKEventStore()

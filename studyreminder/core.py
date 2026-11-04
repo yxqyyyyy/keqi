@@ -24,7 +24,7 @@ DEFAULT_SETTINGS = {
 LEGACY_COURSE_SCOPE = {"chaoxing_homework": ["概率论"], "chaoxing_exams": ["大物", "大学物理"],
                        "xiji": ["计算机组成", "离散数学"]}
 SOURCES = {"chaoxing", "xiji", "manual", "physics"}
-KINDS = {"assignment", "exam"}
+KINDS = {"assignment", "exam", "lecture"}
 
 
 def now_iso():
@@ -68,6 +68,8 @@ def validate_task(raw, existing=None):
     item["start_at"] = parse_datetime(item["start_at"]).isoformat(timespec="seconds") if item.get("start_at") else None
     if item["start_at"] and parse_datetime(item["start_at"]) > parse_datetime(item["due_at"]):
         raise ValueError("开始时间不能晚于截止时间")
+    if item["kind"] == "lecture" and item["start_at"] and item["start_at"] != item["due_at"]:
+        raise ValueError("上课安排的提醒时间必须与开课时间一致")
     if item["url"] and (urlparse(item["url"]).scheme not in {"http", "https"} or not urlparse(item["url"]).netloc):
         raise ValueError("任务链接只支持 http 或 https")
     item["id"] = existing["id"] if existing else str(uuid.uuid4())
@@ -86,6 +88,38 @@ def stable_key(item):
     return "fallback:" + hashlib.sha256(json.dumps([
         item["source"], item["course"], item["kind"], item["title"], item["due_at"]
     ], ensure_ascii=False).encode()).hexdigest()
+
+
+def _canonical_chaoxing_exam_fingerprint(item):
+    """Reconstruct only the old, fully dated exam-list identity."""
+    if (item.get("source") != "chaoxing" or item.get("kind") != "exam"
+            or not re.fullmatch(r"course:[0-9]+:exam:[0-9]+", item.get("source_key", ""))
+            or not item.get("course") or not item.get("start_at")):
+        return None
+    try:
+        start = parse_datetime(item["start_at"]).isoformat(timespec="seconds")
+    except (TypeError, ValueError):
+        return None
+    if start != item["start_at"]:
+        return None
+    payload = [item["course"], " ".join(item["title"].split()), start]
+    return "exam-list-fingerprint:" + hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def _same_exam_metadata(left, right):
+    return (left.get("source") == right.get("source") == "chaoxing"
+            and left.get("kind") == right.get("kind") == "exam"
+            and all(left.get(key) == right.get(key) for key in ("course", "title", "start_at", "due_at")))
+
+
+def _preserved_notes(*values):
+    """Keep every distinct note intact, or refuse a merge beyond our limit."""
+    result = ""
+    for value in values:
+        if value and value not in result:
+            result += ("\n\n" if result else "") + value
+    return result if len(result) <= 6000 else None
 
 
 def physics_occurrences(settings, now=None, weeks=8):
@@ -302,15 +336,71 @@ class Store:
             prepared.append(item)
         result = []
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            # A fingerprint may describe multiple real exams. Check the whole
+            # existing database and whole incoming batch before migrating any
+            # item, so input order cannot silently bind an ambiguous identity.
+            canonical_keys = {}
+            existing_items = [json.loads(row[0]) for row in db.execute("SELECT body FROM tasks")]
+            for candidate in existing_items + prepared:
+                fingerprint = _canonical_chaoxing_exam_fingerprint(candidate)
+                if fingerprint:
+                    canonical_keys.setdefault(fingerprint, set()).add(candidate["source_key"])
             for item in prepared:
                 key = item["id"] if item["source"] == "physics" else stable_key(item)
                 row = db.execute("SELECT id, body FROM tasks WHERE dedup=?", (key,)).fetchone()
+                fingerprint = _canonical_chaoxing_exam_fingerprint(item)
+                if fingerprint and len(canonical_keys[fingerprint]) == 1:
+                    old = db.execute("SELECT id, body FROM tasks WHERE dedup=?",
+                                     ("chaoxing:" + fingerprint,)).fetchone()
+                    if old:
+                        legacy = json.loads(old[1])
+                        duplicate = json.loads(row[1]) if row else None
+                        notes = _preserved_notes(legacy.get("notes", ""),
+                                                 duplicate.get("notes", "") if duplicate else "",
+                                                 item.get("notes", ""))
+                        if (legacy.get("source_key") == fingerprint and _same_exam_metadata(legacy, item)
+                                and (duplicate is None or _same_exam_metadata(duplicate, item))):
+                            completed = (item["status"] == "completed" or legacy["status"] == "completed"
+                                         or (duplicate is not None and duplicate["status"] == "completed"))
+                            if notes is None:
+                                # Keeping both records protects over-limit user
+                                # notes. Their exact identity is still proven,
+                                # so a completed exam must not leave an old
+                                # pending reminder behind.
+                                if completed:
+                                    item["status"] = "completed"
+                                    if legacy["status"] != "completed":
+                                        legacy["status"] = "completed"
+                                        legacy["updated_at"] = now_iso()
+                                        db.execute("UPDATE tasks SET body=? WHERE id=?",
+                                                   (json.dumps(legacy, ensure_ascii=False), old[0]))
+                            else:
+                                # Keep the original task/calendar identity.
+                                # Remove an exact duplicate in this transaction
+                                # before moving its unique dedup key.
+                                if row:
+                                    db.execute("DELETE FROM tasks WHERE id=?", (row[0],))
+                                db.execute("UPDATE tasks SET dedup=? WHERE id=?", (key, old[0]))
+                                legacy["notes"] = notes
+                                if completed:
+                                    legacy["status"] = "completed"
+                                if not legacy.get("calendar_id") and duplicate:
+                                    legacy["calendar_id"] = duplicate.get("calendar_id")
+                                row = (old[0], json.dumps(legacy, ensure_ascii=False))
                 if row:
                     existing = json.loads(row[1])
                     # A stale import must not undo a user's completed state.
                     item["id"] = row[0]
                     if existing["status"] == "completed":
                         item["status"] = "completed"
+                    if fingerprint:
+                        # Keep user notes on later reimports after the legacy
+                        # key has disappeared; repeating a sync is idempotent.
+                        item["notes"] = _preserved_notes(existing.get("notes", ""), item["notes"])
+                        if item["notes"] is None:
+                            item["notes"] = existing.get("notes", "")
+                        item["calendar_id"] = existing.get("calendar_id")
                 db.execute("INSERT INTO tasks VALUES (?, ?, ?) ON CONFLICT(dedup) DO UPDATE SET body=excluded.body",
                            (item["id"], key, json.dumps(item, ensure_ascii=False)))
                 result.append(item)
@@ -333,7 +423,7 @@ def fold_ics(line):
     return "\r\n".join(lines)
 
 
-def to_ics(tasks):
+def to_ics(tasks, platform_synced_at=None, platform_sync_attempted_at=None, platform_sync_result=None):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Study Deadline//CN", "CALSCALE:GREGORIAN", "X-WR-CALNAME:作业与考试"]
     for item in tasks:
@@ -341,7 +431,18 @@ def to_ics(tasks):
             continue
         due = parse_datetime(item["due_at"]).astimezone(timezone.utc)
         description = item.get("notes", "")
-        if item.get("start_at"):
+        metadata = []
+        if platform_synced_at:
+            metadata.append("平台最近成功同步：" + platform_synced_at)
+        if platform_sync_attempted_at:
+            metadata.append("平台最近尝试同步：" + platform_sync_attempted_at)
+            if platform_sync_result in {"never", "running", "success", "partial", "failed", "scope_changed", "interrupted"}:
+                metadata.append("平台同步结果：" + platform_sync_result)
+        description = "\n".join(metadata + ([description] if description else []))
+        if item.get("kind") == "lecture":
+            description += "\n类型：lecture\n上课时间：" + parse_datetime(item["due_at"]).strftime("%Y-%m-%d %H:%M 北京时间")
+            description += "\n仅记录开课时间；日历事件时长为提醒占位，不代表课长。"
+        elif item.get("start_at"):
             description += "\n考试开始：" + parse_datetime(item["start_at"]).strftime("%Y-%m-%d %H:%M 北京时间")
         lines += ["BEGIN:VEVENT", "UID:" + item["id"] + "@study-deadline.local", "DTSTAMP:" + stamp,
                   "DTSTART:" + due.strftime("%Y%m%dT%H%M%SZ"),

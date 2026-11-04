@@ -45,8 +45,16 @@ WORK_METADATA_PATH = "/mooc-ans/mooc2/work/dowork"
 FULL_DATE = r"20\d{2}\s*[-/.年]\s*\d{1,2}\s*[-/.月]\s*\d{1,2}日?[ T\s]+\d{1,2}[:：]\d{2}(?:[:：]\d{2})?"
 SHORT_DATE = r"\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}"
 DATE_RE = re.compile(FULL_DATE)
-DONE = ("已提交", "待批阅", "已批阅", "已批改", "已完成")
-PENDING = ("未提交", "未交", "待提交", "未完成", "未作答", "待作答", "作答中", "答题中", "进行中", "未开始", "待完成", "已撤回", "已退回")
+DONE = ("已提交", "已交卷", "待批阅", "已批阅", "已批改", "待评阅", "已评阅", "已完成")
+PENDING = ("未提交", "未交", "待提交", "待交卷", "未完成", "未作答", "待作答", "作答中", "答题中", "进行中", "未开始", "待完成", "已撤回", "已退回")
+EXAM_STATUS_LABELS = tuple(dict.fromkeys((*DONE, *PENDING, "未交卷", "需重交", "需要重交", "已结束", "已发布")))
+EXAM_NAV_LABELS = {"全部", "全部考试", "未开始", "未考", "待考", "待考试", "待参加", "进行中", "考试中",
+                   "未完成", "未提交", "未交卷", "已完成", "已提交", "已交卷", "已考", "已结束", "已参加", "已过期"}
+EXAM_NAV_FIELDS = {"type", "status", "state", "tab", "examtype", "examstatus", "examstate", "issubmit",
+                   "page", "pagenum", "pagesize", "pageindex", "currentpage"}
+EXAM_OPTION_STATES = set(EXAM_NAV_LABELS) | set(EXAM_STATUS_LABELS) | {
+    "待做", "已做", "待批改", "待评卷", "已阅卷", "待阅卷", "已截止", "缺考",
+}
 
 
 class _Node:
@@ -355,6 +363,140 @@ def _completion_status(value):
     return "pending" if any(mark in value for mark in PENDING) else None
 
 
+def _exam_status_labels(node):
+    """Extract only known state labels, never action text or arbitrary contents."""
+    labels = []
+    allowed = sorted(EXAM_STATUS_LABELS, key=len, reverse=True)
+    pattern = "|".join(re.escape(label) for label in allowed)
+    # A state can be wrapped in a span or accompanied by a separate action
+    # link. Examine each text fragment, but reject action sentences such as
+    # '查看已完成考试'; substring matching would turn those into submissions.
+    for child in node.walk():
+        if child.tag in {"script", "style"}:
+            continue
+        for value in child.children:
+            if not isinstance(value, str):
+                continue
+            value = value.strip()
+            matches = re.findall(pattern, value)
+            residue = re.sub(pattern, "", value)
+            if matches and not re.sub(r"[\s:：,，;；/|()（）【】\[\]、]+", "", residue):
+                labels.extend(matches)
+    return list(dict.fromkeys(labels))
+
+
+def _exam_submission_state(cells):
+    """Read the personal response column, independently of exam availability."""
+    # The reference list uses column 5 for availability and column 6 for the
+    # current student's response. Never fall back to '未开始/进行中/已结束'
+    # in the availability column when the response column is present.
+    index = 5 if len(cells) > 5 else 4
+    labels = _exam_status_labels(cells[index])
+    personal = [label for label in labels if label not in {"未开始", "进行中", "已结束", "已发布"}]
+    if any(label in {"已撤回", "已退回", "需重交", "需要重交"} for label in personal):
+        return "pending", " ".join(personal), index
+    states = {_completion_status(label) for label in personal} - {None}
+    completion = next(iter(states)) if len(states) == 1 else None
+    return completion, " ".join(personal), index
+
+
+def _exam_list_navigation(tree):
+    """Diagnose list tabs as inert, redacted metadata; never follow them here."""
+    result, seen = [], set()
+    list_paths = {"/exam-ans/exam/test/examcode/examlist", "/exam/test/examcode/examlist"}
+    for node in tree.walk():
+        if node.tag not in {"a", "li", "span", "button", "option", "label"}:
+            continue
+        ancestor = node.parent
+        in_exam_row = False
+        while ancestor:
+            if ancestor.tag == "tr" and ancestor.has_class("dataTr"):
+                in_exam_row = True
+                break
+            ancestor = ancestor.parent
+        if in_exam_row:
+            continue
+        label = re.sub(r"[\s（(]*\d+[)）]?\s*$", "", " ".join(node.text().split())).strip()
+        if label not in EXAM_NAV_LABELS:
+            continue
+        item = {"label": label, "tag": node.tag}
+        if any(node.has_class(name) for name in ("active", "cur", "current", "on", "selected")) \
+                or node.attrs.get("aria-selected") == "true" or "selected" in node.attrs:
+            item["selected"] = True
+        target = node.attrs.get("href") or node.attrs.get("data-url") or node.attrs.get("dataurl")
+        if target:
+            try:
+                parsed = urlparse(urljoin(EXAMS, html.unescape(target)))
+                trusted = parsed.scheme == "https" and not parsed.username and not parsed.password \
+                    and parsed.hostname in {"mooc1-api.chaoxing.com", "mooc1.chaoxing.com"} \
+                    and parsed.port in {None, 443}
+                if trusted and parsed.path in list_paths:
+                    item["path"] = parsed.path
+                    fields = parse_qs(parsed.query, keep_blank_values=True)
+                    item["query_fields"] = sorted(key for key in fields if key.lower() in EXAM_NAV_FIELDS)
+                    item["numeric_options"] = {key: values[0] for key, values in fields.items()
+                                               if key.lower() in EXAM_NAV_FIELDS and len(values) == 1
+                                               and re.fullmatch(r"\d{1,3}", values[0])}
+                else:
+                    item["target"] = "other_route"
+            except ValueError:
+                item["target"] = "invalid_route"
+        script_call = node.attrs.get("onclick", "")
+        if not script_call and node.attrs.get("href", "").lower().startswith("javascript:"):
+            script_call = node.attrs["href"].split(":", 1)[1]
+        if script_call:
+            calls = _onclick_structure(script_call)
+            # Function names and source strings are unnecessary to identify a
+            # status tab. Keep only short literal selector positions, not IDs.
+            item["onclick_calls"] = [{"argument_count": call["argument_count"],
+                                       "numeric_arguments": [arg for arg in call["numeric_arguments"]
+                                                             if re.fullmatch(r"\d{1,3}", arg["value"])]}
+                                      for call in calls[:4]]
+        attributes = {name: value for name, value in node.attrs.items()
+                      if (name.lower().removeprefix("data-") in EXAM_NAV_FIELDS or name == "value")
+                      and re.fullmatch(r"\d{1,3}", value or "")}
+        if attributes:
+            item["numeric_attributes"] = attributes
+        if node.tag == "option" and node.parent and node.parent.tag == "select":
+            name = node.parent.attrs.get("name") or node.parent.attrs.get("id", "")
+            if name.lower() in EXAM_NAV_FIELDS:
+                item["field"] = name
+                if re.fullmatch(r"\d{1,3}", node.attrs.get("value", "")):
+                    item["numeric_option"] = node.attrs["value"]
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+        if len(result) >= 30:
+            break
+    return result
+
+
+def _exam_status_options(tree):
+    """All options of the observed status filter, with fixed words only."""
+    result = []
+    pattern = "|".join(re.escape(label) for label in sorted(EXAM_OPTION_STATES, key=len, reverse=True))
+    for select in tree.walk():
+        if select.tag != "select" or select.attrs.get("name", "").lower() != "status":
+            continue
+        for node in select.walk():
+            if node.tag != "option":
+                continue
+            text = " ".join(node.text().split())
+            item = {"selected": "selected" in node.attrs,
+                    "label_exact": text if text in EXAM_OPTION_STATES else "unknown",
+                    "state_tokens": list(dict.fromkeys(re.findall(pattern, text)))}
+            value = node.attrs.get("value", "")
+            if re.fullmatch(r"\d{1,3}", value):
+                item["numeric_option"] = value
+            else:
+                item["value_kind"] = "empty" if not value else "other"
+            result.append(item)
+            if len(result) >= 30:
+                return result
+    return result
+
+
 def _confirmed_work_dates(tree, year):
     """Use a user-confirmed start year for one explicit MM-DD work range."""
     if isinstance(year, bool) or not isinstance(year, int) or not 2000 <= year < 2100:
@@ -580,7 +722,8 @@ def _exam_row_structure(row):
     return describe(row)
 
 
-def _exam_rows(tree, warnings, course_names=None, unidentified_rows=None, status_updates=None, coverage=None):
+def _exam_rows(tree, warnings, course_names=None, unidentified_rows=None, status_updates=None, coverage=None,
+               status_diagnostics=None):
     results, selected, title_counts, fingerprints, conflicting_keys, exam_updates = [], [], {}, {}, set(), []
     for row in tree.walk():
         if row.tag != "tr" or not row.has_class("dataTr"):
@@ -641,7 +784,6 @@ def _exam_rows(tree, warnings, course_names=None, unidentified_rows=None, status
             due, start = _dates(row)
         if start and due and start > due:
             start = None
-        status = " ".join(cell.text() for cell in cells[4:7])
         if exam_id:
             key = "course:" + course_id + ":exam:" + exam_id if course_id else "global-exam:" + exam_id
         else:
@@ -667,18 +809,24 @@ def _exam_rows(tree, warnings, course_names=None, unidentified_rows=None, status
                 continue
             if due:
                 fingerprints[key] = due
-        answer_status = cells[5].text() if len(cells) > 5 else status
-        completion = _completion_status(answer_status) or _completion_status(status)
+        completion, status_evidence, status_column = _exam_submission_state(cells)
+        if status_diagnostics is not None and len(status_diagnostics) < 40:
+            status_diagnostics.append({
+                "source_key": key, "response_column": status_column,
+                "status_cells": [{"index": index, "labels": _exam_status_labels(cell)}
+                                 for index, cell in enumerate(cells) if index >= 4],
+                "recognized_status": completion or "unknown",
+            })
         if coverage is not None and (completion is None or (not due and completion != "completed")):
             coverage["exam_rows_incomplete"] += 1
         if completion:
-            status_evidence = answer_status if _completion_status(answer_status) else status
             exam_updates.append({"source": "chaoxing", "source_key": key, "status": completion,
                                  "status_evidence": " ".join(status_evidence.split())[:160]})
         if not due:
             warnings.append("考试「" + title[:60] + "」没有可核实年份的明确截止时间，需手动核对")
             continue
-        candidate = _candidate(title, identity[0] or "考试", "exam", due, start, key, EXAMS, status, cells[2].text())
+        candidate = _candidate(title, identity[0] or "考试", "exam", due, start, key, EXAMS,
+                               status_evidence if completion else "", cells[2].text())
         if completion:
             candidate["status"] = completion
         if not exam_id:
@@ -708,12 +856,21 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
     unidentified_exam_rows = []
     work_time_evidence = []
     work_status_evidence, status_updates = [], []
+    exam_status_evidence = []
+    exam_list_navigation = []
+    exam_completed_list_navigation = []
+    exam_awaiting_review_list_navigation = []
+    exam_status_options = []
     year_binding = None
     reader = _Reader(context)
     coverage = {"courses_found": 0, "courses_in_scope": 0, "courses_out_of_scope": 0, "courses_attempted": 0,
                 "work_lists_read": 0, "work_lists_empty": 0, "work_lists_unrecognized": 0,
                 "work_details_read": 0, "work_items_incomplete": 0, "courses_completed": 0,
                 "courses_without_work_module": 0, "exam_lists_read": 0, "exam_list_recognized": False,
+                "exam_completed_list_available": False, "exam_completed_lists_read": 0,
+                "exam_completed_list_recognized": False,
+                "exam_awaiting_review_list_available": False, "exam_awaiting_review_lists_read": 0,
+                "exam_awaiting_review_list_recognized": False,
                 "exam_rows_in_scope": 0, "exam_rows_unrecognized": 0, "exam_rows_incomplete": 0,
                 "homework_scope_missing": list(homework_courses),
                 "homework_disabled": not homework_courses, "exams_disabled": not exam_courses,
@@ -736,13 +893,52 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
             try:
                 _, exam_tree = reader.get(EXAMS)
                 coverage["exam_lists_read"] += 1
+                exam_list_navigation = _exam_list_navigation(exam_tree)
+                exam_status_options = _exam_status_options(exam_tree)
                 # A successful HTTP response alone cannot establish that an empty
                 # list is really empty: an error/layout-change page can also be 200.
                 coverage["exam_list_recognized"] = bool(re.search(
                     r"暂无(?:相关)?考试|没有(?:相关)?考试|暂无(?:相关)?数据|没有(?:相关)?数据|无考试记录", exam_tree.text()))
-                candidates.extend(_exam_rows(exam_tree, warnings, exam_courses, unidentified_exam_rows, status_updates, coverage))
+                candidates.extend(_exam_rows(exam_tree, warnings, exam_courses, unidentified_exam_rows,
+                                             status_updates, coverage, exam_status_evidence))
                 if not coverage["exam_list_recognized"]:
                     warnings.append("考试列表结构未识别，不能确认考试是否为空，请人工核对")
+                # Both selectors were observed on the authenticated list.
+                # Each authorizes one GET only when this response still has
+                # that exact option; never infer a submission from its filter.
+                default_recognized = coverage["exam_list_recognized"]
+                for prefix, label, value, list_filter in (
+                        ("exam_completed", "已完成", "3", "completed"),
+                        ("exam_awaiting_review", "待批阅", "4", "awaiting_review")):
+                    available = any(item["label_exact"] == label and item.get("numeric_option") == value
+                                    for item in exam_status_options)
+                    coverage[prefix + "_list_available"] = available
+                    if not available:
+                        continue
+                    try:
+                        _, filtered_tree = reader.get(EXAMS, {"status": value})
+                        coverage[prefix + "_lists_read"] += 1
+                        navigation = _exam_list_navigation(filtered_tree)
+                        if list_filter == "completed":
+                            exam_completed_list_navigation = navigation
+                        else:
+                            exam_awaiting_review_list_navigation = navigation
+                        coverage["exam_list_recognized"] = bool(re.search(
+                            r"暂无(?:相关)?考试|没有(?:相关)?考试|暂无(?:相关)?数据|没有(?:相关)?数据|无考试记录", filtered_tree.text()))
+                        before_diagnostics = len(exam_status_evidence)
+                        candidates.extend(_exam_rows(filtered_tree, warnings, exam_courses, unidentified_exam_rows,
+                                                     status_updates, coverage, exam_status_evidence))
+                        coverage[prefix + "_list_recognized"] = coverage["exam_list_recognized"]
+                        for evidence in exam_status_evidence[before_diagnostics:]:
+                            evidence["list_filter"] = list_filter
+                        if not coverage[prefix + "_list_recognized"]:
+                            warnings.append(label + "考试列表结构未识别，已保留其他列表结果，请人工核对")
+                    except _LoginRequired:
+                        raise
+                    except _ReadError as exc:
+                        warnings.append(label + "考试列表：" + str(exc))
+                    finally:
+                        coverage["exam_list_recognized"] = default_recognized
             except _LoginRequired:
                 raise
             except _ReadError as exc:
@@ -888,13 +1084,22 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
     if exam_courses:
         warnings.append("学习通仅采集指定课程的作业与考试；考试当前读取全局列表，课程内独立考试可能遗漏，候选仍需本人核对。")
     unique_updates, conflicting_updates = {}, set()
+    exam_deadlines = {}
+    for item in candidates:
+        if item["kind"] == "exam":
+            exam_deadlines.setdefault(item["source_key"], set()).add(item["due_at"])
+    conflicting_exam_deadlines = {key for key, values in exam_deadlines.items() if len(values) > 1}
+    if conflicting_exam_deadlines:
+        conflicting_updates.update(conflicting_exam_deadlines)
+        coverage["exam_rows_incomplete"] += len(conflicting_exam_deadlines)
+        warnings.append("考试列表之间的截止时间互相冲突，未自动导入或更新完成状态，请本人核对")
     for update in status_updates:
         key = update["source_key"]
         if key in unique_updates and unique_updates[key]["status"] != update["status"]:
             conflicting_updates.add(key)
         unique_updates[key] = update
     if conflicting_updates:
-        warnings.append("部分作业或考试的列表状态互相冲突，未自动更新完成状态，请本人核对")
+        warnings.append("部分作业或考试的列表信息互相冲突，未自动更新完成状态，请本人核对")
     unique = {item["source_key"]: item for item in candidates if item["source_key"] not in conflicting_updates}
     # Only a complete metadata/status read may satisfy the daily schedule.
     # Confirmed submissions need no deadline to cancel an existing reminder.
@@ -903,10 +1108,19 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
         and coverage["work_lists_read"] == coverage["courses_in_scope"]
         and coverage["work_lists_unrecognized"] == 0 and coverage["work_items_incomplete"] == 0)
     exams_complete = not exam_courses or (coverage["exam_lists_read"] == 1 and coverage["exam_list_recognized"]
-        and coverage["exam_rows_unrecognized"] == 0 and coverage["exam_rows_incomplete"] == 0)
+        and coverage["exam_rows_unrecognized"] == 0 and coverage["exam_rows_incomplete"] == 0
+        and (not coverage["exam_completed_list_available"] or (
+            coverage["exam_completed_lists_read"] == 1 and coverage["exam_completed_list_recognized"]))
+        and (not coverage["exam_awaiting_review_list_available"] or (
+            coverage["exam_awaiting_review_lists_read"] == 1 and coverage["exam_awaiting_review_list_recognized"])))
     coverage["complete"] = bool(auth["authenticated"] and homework_complete and exams_complete and not conflicting_updates)
     return {"candidates": list(unique.values()), "status_updates": [item for key, item in unique_updates.items() if key not in conflicting_updates],
             "warnings": list(dict.fromkeys(warnings)), "auth": auth,
             "diagnostics": {**reader.diagnostics(), "coverage": coverage, "unidentified_exam_rows": unidentified_exam_rows,
                             "work_time_evidence": work_time_evidence, "work_status_evidence": work_status_evidence,
+                            "exam_status_evidence": exam_status_evidence,
+                            "exam_list_navigation": exam_list_navigation,
+                            "exam_completed_list_navigation": exam_completed_list_navigation,
+                            "exam_awaiting_review_list_navigation": exam_awaiting_review_list_navigation,
+                            "exam_status_options": exam_status_options,
                             "homework_year_binding": year_binding}}

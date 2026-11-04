@@ -42,3 +42,10 @@ htmlcov/
 .DS_Store
 .AppleDouble
 ._*
+
+# iPhone 工程的本机构建与个人签名状态
+**/.build/
+**/.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate

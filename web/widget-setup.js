@@ -23,7 +23,7 @@ copyButton.addEventListener('click', async () => {
   try {
     if (navigator.clipboard && window.isSecureContext) {
       await navigator.clipboard.writeText(source.value);
-      status.textContent = '已复制。请在 Scriptable 新建脚本并粘贴。';
+      status.textContent = '已复制。首次安装请新建脚本；升级请替换原“课期”脚本的全部内容，再运行一次。';
       return;
     }
   } catch { /* Local HTTP on iPhone may not expose the Clipboard API. */ }
@@ -33,7 +33,7 @@ copyButton.addEventListener('click', async () => {
   source.setSelectionRange(0, source.value.length);
   let copied = false;
   try { copied = document.execCommand('copy'); } catch { /* Select for manual copy below. */ }
-  status.textContent = copied ? '已复制。请在 Scriptable 新建脚本并粘贴。' : '脚本已选中，请长按并选择“拷贝”，然后粘贴到 Scriptable。';
+  status.textContent = copied ? '已复制。首次安装请新建脚本；升级请替换原“课期”脚本的全部内容，再运行一次。' : '脚本已选中，请长按并选择“拷贝”，再到 Scriptable 替换原“课期”脚本的全部内容并运行。';
 });
 
 loadScript();

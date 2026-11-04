@@ -9,3 +9,7 @@
 @media(prefers-reduced-transparency:reduce){.mobile-nav{background:#f8faf8;backdrop-filter:none}dialog::backdrop{backdrop-filter:none}}
 
 .candidate-evidence{margin-top:14px;color:var(--muted);font-size:13px}.candidate-evidence summary{cursor:pointer}.candidate-evidence p{white-space:pre-wrap;line-height:1.65;overflow-wrap:anywhere}
+
+.platform-actions{display:flex;flex-wrap:wrap;gap:10px}.platform-actions .button{white-space:normal;text-align:left}
+
+.sync-overview{margin:0 0 24px;padding:17px 20px;border:1px solid var(--line);border-radius:var(--control-radius);background:var(--surface)}.sync-overview-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:12px}.sync-overview-heading strong{font-weight:500;color:var(--accent)}.sync-overview p{margin:7px 0 0;font-size:13px;overflow-wrap:anywhere}.sync-overview .sync-source-times,.sync-overview .sync-attempt,.sync-overview .sync-calendar-time{font-size:12px;color:var(--muted)}.platform-sync-detail{margin:12px 0 18px;padding-top:10px;border-top:1px solid var(--line)}.platform-sync-detail p{margin:4px 0;font-size:12px;color:var(--muted)}

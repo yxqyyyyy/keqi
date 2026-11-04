@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -11,6 +12,19 @@ from studyreminder.collector import candidates_from_blocks, platform_for
 def task(**kw):
     return {"title": "第一章作业", "course": "测试课程", "source": "chaoxing", "kind": "assignment",
             "due_at": "2026-10-18T00:00:00+08:00", **kw}
+
+
+def exam(**kw):
+    return task(**{"title": "磁学", "course": "大学物理", "kind": "exam",
+                   "start_at": "2026-10-17T18:00:00+08:00", "source_key": "course:266326215:exam:10922878", **kw})
+
+
+def legacy_exam(**kw):
+    item = exam(**kw)
+    payload = [item["course"], " ".join(item["title"].split()), item.get("start_at")]
+    item["source_key"] = "exam-list-fingerprint:" + hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    return item
 
 
 class DeadlineTests(unittest.TestCase):
@@ -78,6 +92,46 @@ class DeadlineTests(unittest.TestCase):
         self.assertNotIn("BEGIN:VEVENT", completed_text)
         self.assertNotIn("BEGIN:VALARM", completed_text)
 
+    def test_ics_includes_real_platform_time_without_changing_task_update_time(self):
+        item = self.store.put_task(task(notes="原备注;换行\n内容,保留"))
+        original = dict(item)
+        timestamp = "2026-10-18T08:02:00+08:00"
+        text = to_ics([item], platform_synced_at=timestamp).replace("\r\n ", "")
+        self.assertIn("平台最近成功同步：" + timestamp, text)
+        self.assertIn("原备注\\;换行\\n内容\\,保留", text)
+        self.assertEqual(item, original)
+        self.assertNotIn("平台最近成功同步：", to_ics([item]))
+
+    def test_lecture_reminders_use_the_supplied_class_time_in_beijing(self):
+        lecture = {"title": "Lecture 3（上课）", "course": "拔尖课程", "source": "manual", "kind": "lecture",
+                   "due_at": "2026-10-31T20:00:00+08:00", "source_key": "lecture:ba-jian:3:2026-10-31"}
+        item = self.store.import_tasks([lecture])[0]
+        repeated = self.store.import_tasks([lecture])[0]
+        self.assertEqual(repeated["id"], item["id"])
+        self.assertIsNone(item["start_at"])
+        text = to_ics([item]).replace("\r\n ", "")
+        self.assertIn("DTSTART:20261031T120000Z", text)
+        self.assertIn("上课时间：2026-10-31 20:00 北京时间", text)
+        self.assertNotIn("考试开始", text)
+        self.assertIn("不代表课长", text)
+        self.assertEqual(text.count("BEGIN:VALARM"), 3)
+        self.assertIn("TRIGGER:-PT48H", text)
+        self.assertIn("TRIGGER:-PT24H", text)
+        self.assertIn("TRIGGER:-PT2H", text)
+        completed = self.store.put_task({"status": "completed"}, item["id"])
+        self.assertNotIn("BEGIN:VEVENT", to_ics([completed]))
+
+    def test_lecture_cannot_silently_remind_at_a_different_start_time(self):
+        with self.assertRaisesRegex(ValueError, "开课时间一致"):
+            self.store.put_task(task(kind="lecture", start_at="2026-10-17T18:00:00+08:00"))
+
+    def test_partial_ics_attempt_does_not_claim_success(self):
+        item = self.store.put_task(task())
+        text = to_ics([item], platform_sync_attempted_at="2026-10-18T08:00:00+08:00", platform_sync_result="partial").replace("\r\n ", "")
+        self.assertIn("平台最近尝试同步：2026-10-18T08:00:00+08:00", text)
+        self.assertIn("平台同步结果：partial", text)
+        self.assertNotIn("平台最近成功同步：", text)
+
     def test_bad_url_and_inverted_exam_range_rejected(self):
         with self.assertRaises(ValueError):
             self.store.put_task(task(url="javascript:alert(1)"))
@@ -96,6 +150,167 @@ class DeadlineTests(unittest.TestCase):
         self.assertIsNone(platform_for("https://chaoxing.com.evil.example/"))
         self.assertEqual(platform_for("https://mooc1.chaoxing.com/"), "chaoxing")
         self.assertEqual(platform_for("https://cslabcg.whu.edu.cn/"), "xiji")
+
+
+class LegacyExamMigrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = Store(Path(self.temp.name) / "tasks.sqlite3")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_exact_legacy_pending_exam_upgrades_in_place_to_completed_canonical(self):
+        old = self.store.put_task(legacy_exam(notes="我自己的复习备注"))
+        imported = self.store.import_tasks([exam(status="completed", notes="平台已交卷")])[0]
+        self.assertEqual(imported["id"], old["id"])
+        self.assertEqual(imported["source_key"], exam()["source_key"])
+        self.assertEqual(imported["status"], "completed")
+        self.assertIn("我自己的复习备注", imported["notes"])
+        self.assertIn("平台已交卷", imported["notes"])
+        self.assertEqual(len(self.store.tasks()), 1)
+        repeated = self.store.import_tasks([exam(status="pending", notes="平台已交卷")])[0]
+        self.assertEqual(repeated["id"], old["id"])
+        self.assertEqual(repeated["status"], "completed")
+        self.assertEqual(repeated["notes"], imported["notes"])
+        self.assertEqual(len(self.store.tasks()), 1)
+
+    def test_completed_legacy_status_survives_pending_canonical_import(self):
+        old = self.store.put_task(legacy_exam(status="completed"))
+        result = self.store.import_tasks([exam()])[0]
+        self.assertEqual((result["id"], result["status"]), (old["id"], "completed"))
+
+    def test_existing_canonical_duplicate_merges_into_original_preserving_both_notes_and_completion(self):
+        for completed_owner in ("legacy", "canonical"):
+            with self.subTest(completed_owner=completed_owner), tempfile.TemporaryDirectory() as directory:
+                store = Store(Path(directory) / "tasks.sqlite3")
+                old = store.put_task(legacy_exam(status="completed" if completed_owner == "legacy" else "pending", notes="旧任务的用户备注"))
+                duplicate = store.put_task(exam(status="completed" if completed_owner == "canonical" else "pending", notes="新任务的用户备注"))
+                result = store.import_tasks([exam(notes="平台说明")])[0]
+                self.assertEqual((result["id"], result["status"]), (old["id"], "completed"))
+                for note in ("旧任务的用户备注", "新任务的用户备注", "平台说明"):
+                    self.assertIn(note, result["notes"])
+                self.assertEqual(len(store.tasks()), 1)
+                with self.assertRaises(KeyError):
+                    store.get_task(duplicate["id"])
+                repeated = store.import_tasks([exam(notes="平台说明")])[0]
+                self.assertEqual(repeated["notes"], result["notes"])
+
+    def test_different_title_course_start_or_due_never_migrates(self):
+        variants = ({"title": "磁学测验"}, {"title": "磁  学"}, {"course": "大物"},
+                    {"start_at": "2026-10-17T19:00:00+08:00"}, {"due_at": "2026-10-19T00:00:00+08:00"})
+        for change in variants:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                store = Store(Path(directory) / "tasks.sqlite3")
+                old = store.put_task(legacy_exam())
+                result = store.import_tasks([{**exam(), **change, "status": "completed"}])[0]
+                self.assertNotEqual(result["id"], old["id"])
+                self.assertEqual(store.get_task(old["id"])["status"], "pending")
+                self.assertEqual(len(store.tasks()), 2)
+
+    def test_source_kind_missing_start_or_noncanonical_id_cannot_enable_migration(self):
+        variants = ({"source": "xiji"}, {"kind": "assignment"}, {"start_at": None},
+                    {"source_key": "course:266326215:exam:unknown"},
+                    {"source_key": "course:266326215:exam:１０９２２８７８"})
+        for change in variants:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                store = Store(Path(directory) / "tasks.sqlite3")
+                old_raw = {**legacy_exam(), **{k: v for k, v in change.items() if k != "source_key"}}
+                old = store.put_task(old_raw)
+                result = store.import_tasks([{**exam(), **change, "status": "completed"}])[0]
+                self.assertNotEqual(result["id"], old["id"])
+                self.assertEqual(len(store.tasks()), 2)
+                self.assertEqual(store.get_task(old["id"])["status"], "pending")
+
+    def test_collapsed_fingerprint_is_insufficient_without_exact_title_equality(self):
+        old = self.store.put_task(legacy_exam(title="磁学  测验"))
+        result = self.store.import_tasks([{**exam(), "title": "磁学 测验", "status": "completed"}])[0]
+        self.assertNotEqual(result["id"], old["id"])
+        self.assertEqual(len(self.store.tasks()), 2)
+
+    def test_legacy_fingerprint_itself_must_match_recomputed_identity(self):
+        old = self.store.put_task({**legacy_exam(), "source_key": "exam-list-fingerprint:" + "a" * 64})
+        result = self.store.import_tasks([exam(status="completed")])[0]
+        self.assertNotEqual(result["id"], old["id"])
+        self.assertEqual(len(self.store.tasks()), 2)
+
+    def test_multiple_canonical_keys_in_one_batch_refuse_migration_in_either_order(self):
+        first, second = exam(status="completed"), {**exam(), "source_key": "course:266326215:exam:10922879", "status": "completed"}
+        for incoming in ([first, second], [second, first]):
+            with self.subTest(keys=[item["source_key"] for item in incoming]), tempfile.TemporaryDirectory() as directory:
+                store = Store(Path(directory) / "tasks.sqlite3")
+                old = store.put_task(legacy_exam())
+                results = store.import_tasks(incoming)
+                self.assertTrue(all(item["id"] != old["id"] for item in results))
+                self.assertEqual(store.get_task(old["id"])["status"], "pending")
+                self.assertEqual(len(store.tasks()), 3)
+
+    def test_other_existing_canonical_for_same_fingerprint_refuses_migration_even_if_due_differs(self):
+        old = self.store.put_task(legacy_exam())
+        self.store.put_task({**exam(), "source_key": "course:266326215:exam:10922879", "due_at": "2026-10-19T00:00:00+08:00"})
+        result = self.store.import_tasks([exam(status="completed")])[0]
+        self.assertNotEqual(result["id"], old["id"])
+        self.assertEqual(self.store.get_task(old["id"])["status"], "pending")
+        self.assertEqual(len(self.store.tasks()), 3)
+
+    def test_nonidentical_existing_canonical_duplicate_does_not_delete_original(self):
+        old = self.store.put_task(legacy_exam())
+        duplicate = self.store.put_task({**exam(), "due_at": "2026-10-19T00:00:00+08:00", "notes": "新任务用户备注"})
+        result = self.store.import_tasks([exam(status="completed")])[0]
+        self.assertEqual(result["id"], duplicate["id"])
+        self.assertEqual(self.store.get_task(old["id"])["status"], "pending")
+        self.assertIn("新任务用户备注", result["notes"])
+        self.assertEqual(len(self.store.tasks()), 2)
+
+    def test_over_limit_notes_refuse_destructive_merge_and_keep_both_user_notes(self):
+        for completed_owner in ("legacy", "canonical", "incoming", None):
+            with self.subTest(completed_owner=completed_owner), tempfile.TemporaryDirectory() as directory:
+                store = Store(Path(directory) / "tasks.sqlite3")
+                old = store.put_task(legacy_exam(status="completed" if completed_owner == "legacy" else "pending",
+                                                 notes="甲" * 3500))
+                duplicate = store.put_task(exam(status="completed" if completed_owner == "canonical" else "pending",
+                                                notes="乙" * 3500))
+                result = store.import_tasks([exam(status="completed" if completed_owner == "incoming" else "pending",
+                                                  notes="平台说明")])[0]
+                self.assertEqual(result["id"], duplicate["id"])
+                original = store.get_task(old["id"])
+                self.assertEqual(original["notes"], "甲" * 3500)
+                self.assertIn("乙" * 3500, result["notes"])
+                self.assertIn("平台说明", result["notes"])
+                expected_status = "completed" if completed_owner else "pending"
+                self.assertEqual((original["status"], result["status"]), (expected_status, expected_status))
+                self.assertEqual(len(store.tasks()), 2)
+                if completed_owner:
+                    self.assertNotIn("BEGIN:VEVENT", to_ics(store.tasks()))
+                repeated = store.import_tasks([exam(notes="平台说明")])[0]
+                self.assertEqual(repeated, {**result, "updated_at": repeated["updated_at"]})
+
+    def test_over_limit_notes_without_existing_canonical_still_cancel_original_reminder(self):
+        old = self.store.put_task(legacy_exam(notes="甲" * 3500))
+        result = self.store.import_tasks([exam(status="completed", notes="乙" * 3500)])[0]
+        self.assertNotEqual(result["id"], old["id"])
+        self.assertEqual(self.store.get_task(old["id"])["notes"], "甲" * 3500)
+        self.assertEqual(result["notes"], "乙" * 3500)
+        self.assertTrue(all(item["status"] == "completed" for item in self.store.tasks()))
+        self.assertEqual(len(self.store.tasks()), 2)
+        self.assertNotIn("BEGIN:VEVENT", to_ics(self.store.tasks()))
+
+    def test_over_limit_notes_cannot_propagate_completion_across_conflicting_metadata(self):
+        old = self.store.put_task(legacy_exam(notes="甲" * 3500))
+        duplicate = self.store.put_task(exam(due_at="2026-10-19T00:00:00+08:00", notes="乙" * 3500))
+        result = self.store.import_tasks([exam(status="completed", notes="平台说明")])[0]
+        self.assertEqual(result["id"], duplicate["id"])
+        self.assertEqual(self.store.get_task(old["id"])["status"], "pending")
+        self.assertEqual(self.store.get_task(old["id"])["notes"], "甲" * 3500)
+        self.assertIn("乙" * 3500, result["notes"])
+        self.assertEqual(len(self.store.tasks()), 2)
+
+    def test_identical_repeated_canonical_in_same_batch_is_not_ambiguous(self):
+        old = self.store.put_task(legacy_exam())
+        results = self.store.import_tasks([exam(), exam(status="completed")])
+        self.assertEqual([item["id"] for item in results], [old["id"], old["id"]])
+        self.assertEqual(self.store.get_task(old["id"])["status"], "completed")
+        self.assertEqual(len(self.store.tasks()), 1)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,19 @@ const palette = {
   urgent: Color.dynamic(new Color("9B583D"), new Color("EAB599")),
   line: Color.dynamic(new Color("DDE5DA"), new Color("35443A")),
 };
+// 暖橙代表 24 小时内，红色代表 2 小时内。颜色和文字同时提示，避免仅靠颜色区分。
+const urgencyPalette = {
+  soon: {
+    background: Color.dynamic(new Color("FFE2BA"), new Color("583218")),
+    ink: Color.dynamic(new Color("44260D"), new Color("FFF0DA")),
+    secondary: Color.dynamic(new Color("704418"), new Color("F3CEA7")),
+    accent: Color.dynamic(new Color("913800"), new Color("FFD6A0")),
+  },
+  critical: {
+    background: Color.dynamic(new Color("AB242C"), new Color("92252D")),
+    ink: new Color("FFFFFF"), secondary: new Color("FFE8E0"), accent: new Color("FFFFFF"),
+  },
+};
 
 function options() {
   const parameter = typeof args.widgetParameter === "string" ? args.widgetParameter.trim() : "";
@@ -69,6 +82,76 @@ function parseBeijing(value) {
       p.hour !== Number(m[4]) || p.minute !== Number(m[5])) return null;
   return result;
 }
+// 平台同步是 Mac 完整读取平台的时间；设备这次读取日历不代表平台刚同步。
+function parsePlatformSync(value) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/.exec(value || "");
+  if (!m || Number(m[1]) < 1) return null;
+  if (m[8] !== "Z") {
+    const hours = Number(m[8].slice(1, 3)), minutes = Number(m[8].slice(4, 6));
+    if (hours > 14 || minutes > 59 || (hours === 14 && minutes !== 0)) return null;
+  }
+  // Date 会把 2 月 30 日等值滚到下个月；先核对原时区的年月日时分秒。
+  const local = new Date(`${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z`);
+  if (!Number.isFinite(local.getTime()) || local.getUTCFullYear() !== Number(m[1]) ||
+      local.getUTCMonth() + 1 !== Number(m[2]) || local.getUTCDate() !== Number(m[3]) ||
+      local.getUTCHours() !== Number(m[4]) || local.getUTCMinutes() !== Number(m[5]) ||
+      local.getUTCSeconds() !== Number(m[6])) return null;
+  const result = new Date(value);
+  return Number.isFinite(result.getTime()) && result <= now ? result : null;
+}
+function uniqueMetadataField(notes, name) {
+  const prefix = `${name}：`;
+  const lines = notes.split(/\r?\n/).filter(line => line.startsWith(prefix));
+  return lines.length === 1 ? lines[0].slice(prefix.length).trim() : "";
+}
+function platformSyncFromNotes(notes) {
+  return parsePlatformSync(uniqueMetadataField(notes, "平台最近成功同步"));
+}
+function platformResultFromNotes(notes) {
+  const value = uniqueMetadataField(notes, "平台同步结果");
+  return ["success", "partial", "failed", "running", "interrupted", "scope_changed", "never"].includes(value) ? value : "";
+}
+function platformSyncText(tasks, family) {
+  // 传播过程中可能混有旧备注。只有所有记录都可验证才报告最早时间，绝不取最新值。
+  const complete = tasks.length && tasks.every(task => task.platformSyncedAt);
+  const attempted = tasks.length && tasks.every(task => task.platformAttemptedAt && task.platformSyncResult);
+  const oldest = name => new Date(Math.min(...tasks.map(task => task[name].getTime())));
+  const resultLabel = () => {
+    const results = tasks.map(task => task.platformSyncResult);
+    if (results.every(value => value === "success")) return "已完成";
+    if (results.every(value => value === "partial")) return "部分";
+    if (results.every(value => value === "running")) return "读取中";
+    return "未完成";
+  };
+  if (complete) {
+    const syncedAt = oldest("platformSyncedAt");
+    const recentIncomplete = attempted && oldest("platformAttemptedAt") >= syncedAt &&
+      tasks.some(task => task.platformSyncResult !== "success");
+    return `平台同步 ${dateText(syncedAt, beijingParts(syncedAt).year !== beijingParts(now).year)}` +
+      (recentIncomplete ? ` · ${resultLabel()}` : "");
+  }
+  if (attempted) {
+    const attemptedAt = oldest("platformAttemptedAt");
+    const date = dateText(attemptedAt, beijingParts(attemptedAt).year !== beijingParts(now).year);
+    return family === "small" ? `尝试 ${date}（${resultLabel()}）` : `平台尝试 ${date} · ${resultLabel()}`;
+  }
+  return "平台同步时间未知";
+}
+function syncFooter(widget, tasks, family, readAt, color = palette.secondary, suffix = "", invalidCount = 0) {
+  const size = family === "small" ? 8 : 9;
+  const conflicts = tasks.filter(task => task.calendarTimeChanged).length;
+  const warning = invalidCount ? ` · ${invalidCount} 项异常` : conflicts ? ` · ${conflicts} 项时间待核对` : "";
+  const readText = readAt ? `日历读取 ${timeText(readAt)}${warning}${suffix}` : "日历读取失败";
+  const platformText = invalidCount ? "平台同步时间未知" : platformSyncText(tasks, family);
+  // 中号维持三项容量：两个来源合并在同一行；小号分两行保留可读性。
+  if (family === "medium") {
+    text(widget, `${platformText} · ${readText}`, size, color);
+  } else {
+    text(widget, platformText, size, color);
+    widget.addSpacer(1);
+    text(widget, readText, size, color);
+  }
+}
 function field(notes, name) {
   const prefix = `${name}：`;
   const line = notes.split(/\r?\n/).find(item => item.startsWith(prefix));
@@ -84,27 +167,38 @@ function shortCourse(course) {
 function taskFromEvent(event) {
   const notes = String(event.notes || "");
   // CalendarEvent 没有公开 URL 属性：仅识别本程序固定备注格式，不展示其他私人事件。
-  if (!notes.startsWith("截止时间：") || !/^本地记录更新时间：.+$/m.test(notes) ||
-      !/^类型：(assignment|exam)$/m.test(notes)) return null;
-  const due = parseBeijing(field(notes, "截止时间"));
+  if (!/^(截止时间|上课时间)：/.test(notes) || !/^本地记录更新时间：.+$/m.test(notes) ||
+      !/^类型：(assignment|exam|lecture)$/m.test(notes)) return null;
+  const kind = field(notes, "类型");
+  const timeField = kind === "lecture" ? "上课时间" : "截止时间";
+  if (!notes.startsWith(timeField + "：")) return null;
+  const due = parseBeijing(field(notes, timeField));
   const originalDue = event.startDate;
-  if (!due || !(originalDue instanceof Date) || !Number.isFinite(originalDue.getTime()) ||
-      Math.abs(due.getTime() - originalDue.getTime()) >= 60000) {
-    throw new Error("存在截止时间格式异常的课期记录。请在 Mac 程序重新同步日历后重试。");
+  if (!due || !(originalDue instanceof Date) || !Number.isFinite(originalDue.getTime())) {
+    throw new Error(`存在${timeField}格式异常的课期记录。请在 Mac 程序重新同步日历后重试。`);
   }
   const course = field(notes, "课程");
   let title = String(event.title || "").trim();
   if (course && title.startsWith(course + " · ")) title = title.slice(course.length + 3);
   if (!title) throw new Error("存在标题缺失的课期记录。请在 Mac 程序重新同步日历。");
-  const kind = field(notes, "类型");
   // 旧桥接也会将作业的发布时刻写为“考试开始”；仅考试使用此字段。
   const startText = kind === "exam" ? field(notes, "考试开始") : "";
   const start = startText ? parseBeijing(startText) : null;
   if (startText && !start) {
     throw new Error("存在考试开始时间格式异常的记录。请在 Mac 程序重新同步日历。");
   }
+  const sameMinute = (a, b) => a instanceof Date && Number.isFinite(a.getTime()) &&
+    Math.abs(a.getTime() - b.getTime()) < 60000;
+  // 兼容旧版的截止占位事件，以及手机/新版桥接显示的真实考试区间。
+  // 09:00–11:30 的考试仍在 11:30 截止，不能把日历开始当成截止。
+  const examInterval = kind === "exam" && start && start < due && !event.isAllDay &&
+    sameMinute(originalDue, start) && sameMinute(event.endDate, due);
+  const calendarTimeChanged = !examInterval && (!sameMinute(originalDue, due) || Boolean(event.isAllDay));
   return { id: event.identifier, course: shortCourse(course), title,
-    kind, due, start, updated: field(notes, "本地记录更新时间"),
+    kind, due, start, calendarTimeChanged, updated: field(notes, "本地记录更新时间"),
+    platformSyncedAt: platformSyncFromNotes(notes),
+    platformAttemptedAt: parsePlatformSync(uniqueMetadataField(notes, "平台最近尝试同步")),
+    platformSyncResult: platformResultFromNotes(notes),
     offline: /线下|纸质/.test(notes) && /大学物理|大物/.test(course),
     overdue: due.getTime() < now.getTime() };
 }
@@ -139,23 +233,44 @@ async function readTasks(calendarId) {
   catch (_) {
     throw new Error("日历读取失败。请检查 Scriptable 日历权限，并在系统日历确认“作业与考试”可查看后再运行。");
   }
-  const tasks = events.map(taskFromEvent).filter(Boolean);
+  // 一条损坏的课期备注不能阻止其他课程显示，也不能伪装成没有待办。
+  const tasks = [];
+  let invalidCount = 0;
+  for (const event of events) {
+    try {
+      const task = taskFromEvent(event);
+      if (task) tasks.push(task);
+    } catch (_) { invalidCount += 1; }
+  }
   const unique = new Map();
   tasks.forEach(task => unique.set(task.id, task));
-  return Array.from(unique.values());
+  return { tasks: Array.from(unique.values()), readAt: new Date(), invalidCount };
+}
+function urgency(task) {
+  const left = task.due.getTime() - now.getTime();
+  if (task.overdue || left < 0 || left > 24 * 3600000) return 0;
+  return left <= 2 * 3600000 ? 2 : 1;
+}
+function taskColors(task) {
+  const level = urgency(task);
+  return level ? urgencyPalette[level === 2 ? "critical" : "soon"] : palette;
+}
+function pendingLabel(task) {
+  return task.kind === "lecture" ? "待上课" : task.kind === "exam" ? "待考" : task.offline ? "线下待交" : "待交";
 }
 function remaining(task) {
+  if (task.due.getTime() === now.getTime()) return task.kind === "lecture" ? "现在上课" : "现在截止";
   const ms = Math.abs(task.due.getTime() - now.getTime());
   let label;
   if (ms < 3600000) label = `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
   else if (ms < 48 * 3600000) label = `${Math.ceil(ms / 3600000)} 小时`;
   else label = `${Math.ceil(ms / DAY)} 天`;
-  return `${task.overdue ? "逾期 " : "剩 "}${label}`;
+  return `${task.overdue ? task.kind === "lecture" ? "已开始 " : "逾期 " : "剩 "}${label}`;
 }
 function deadline(task) {
   const year = beijingParts(task.due).year !== beijingParts(now).year;
-  const prefix = task.overdue ? "已过截止 " : "截止 ";
-  return prefix + dateText(task.due, year);
+  const prefix = task.kind === "lecture" ? task.overdue ? "已开始 " : "上课 " : task.overdue ? "已过截止 " : "截止 ";
+  return (task.calendarTimeChanged ? "备注" : "") + prefix + dateText(task.due, year);
 }
 function examStart(task, compact) {
   if (!task.start) return "";
@@ -175,51 +290,75 @@ function text(container, value, size, color = palette.ink, bold = false, lines =
   element.minimumScaleFactor = 0.85;
   return element;
 }
-function header(widget, family, futureCount, overdueCount) {
+function header(widget, family, future, overdueCount, smallColors) {
   const row = widget.addStack();
   row.centerAlignContent();
-  text(row, "课期", family === "small" ? 15 : 16, palette.green, true);
+  text(row, "课期", family === "small" ? 15 : 16, smallColors ? smallColors.ink : palette.green, true);
   row.addSpacer();
-  const summary = family === "small" ? "北京时间" : futureCount === 0 && overdueCount > 0 ?
-    `未来暂无 · 逾期 ${overdueCount}` : `待办 ${futureCount}${overdueCount ? ` · 逾期 ${overdueCount}` : ""}`;
+  const soon = future.filter(task => urgency(task));
+  const dueAssignments = soon.filter(task => task.kind === "assignment").length;
+  const dueExams = soon.filter(task => task.kind === "exam").length;
+  const dueLectures = soon.filter(task => task.kind === "lecture").length;
+  if (soon.length) {
+    const badge = row.addStack();
+    const colors = smallColors || urgencyPalette[soon.some(task => urgency(task) === 2) ? "critical" : "soon"];
+    badge.backgroundColor = colors.background;
+    badge.cornerRadius = 5;
+    badge.setPadding(2, 5, 2, 5);
+    const counts = [dueAssignments ? `待交 ${dueAssignments}` : "", dueExams ? `待考 ${dueExams}` : "",
+      dueLectures ? `上课 ${dueLectures}` : ""].filter(Boolean).join(" · ");
+    text(badge, `24h ${counts}`, family === "small" ? 10 : 12, colors.ink, true);
+    return;
+  }
+  const summary = family === "small" ? "北京时间" : future.length === 0 && overdueCount > 0 ?
+    `未来暂无 · 逾期 ${overdueCount}` : `待办 ${future.length}${overdueCount ? ` · 逾期 ${overdueCount}` : ""}`;
   text(row, summary, 10, overdueCount ? palette.urgent : palette.secondary);
 }
 function compactRow(container, task, family) {
   const row = container.addStack();
   row.layoutVertically();
+  const level = urgency(task);
+  const colors = taskColors(task);
+  // 每项保持两行；紧急卡只增加 2pt 高度，中号仍可显示 3 项。
+  if (level) {
+    row.backgroundColor = colors.background;
+    row.cornerRadius = 6;
+    row.setPadding(1, 5, 1, 5);
+  }
   const top = row.addStack();
-  const color = task.overdue ? palette.urgent : palette.green;
-  const kind = task.kind === "exam" ? "考试 · " : "";
-  text(top, `${task.course} · ${kind}${task.title}`, 12, palette.ink, true);
+  const kind = level || task.kind === "exam" || task.kind === "lecture" ? `${pendingLabel(task)} · ` : "";
+  text(top, `${task.course} · ${kind}${task.title}`, 12, colors.ink, true);
   top.addSpacer(4);
-  text(top, remaining(task), 10, color);
+  text(top, remaining(task), level ? 12 : 10, level ? colors.accent : task.overdue ? palette.urgent : palette.green, Boolean(level));
   row.addSpacer(2);
-  const second = `${deadline(task)}${task.start ? " · " + examStart(task, true) : ""}`;
-  text(row, second, 10, palette.secondary);
+  const cue = level === 2 && task.kind === "assignment" ? "尽快提交 · " : "";
+  const second = `${cue}${deadline(task)}${task.start ? " · " + examStart(task, true) : ""}`;
+  text(row, second, 10, colors.secondary);
   if (family !== "medium") {
     const note = midnightNote(task);
-    if (note) { row.addSpacer(1); text(row, note, 9, palette.secondary); }
+    if (note) { row.addSpacer(1); text(row, note, 9, colors.secondary); }
   }
 }
-function smallBody(widget, task, overdueCount) {
-  widget.addSpacer(5);
-  text(widget, `${task.course}${task.kind === "exam" ? " · 考试" : ""}`, 10, palette.secondary, true);
+function smallBody(widget, task) {
+  const level = urgency(task);
+  const colors = taskColors(task);
+  widget.addSpacer(3);
+  const label = level === 2 && task.kind === "assignment" ? "尽快提交" : pendingLabel(task);
+  text(widget, `${task.course} · ${label}`, 10, colors.secondary, true);
+  widget.addSpacer(1);
+  text(widget, task.title, 14, colors.ink, true, 2);
   widget.addSpacer(2);
-  text(widget, task.title, 14, palette.ink, true, 2);
-  widget.addSpacer(4);
-  text(widget, remaining(task), 19, task.overdue ? palette.urgent : palette.green, true);
-  widget.addSpacer(2);
-  text(widget, dateText(task.due, beijingParts(task.due).year !== beijingParts(now).year) + " 截止", 10, palette.secondary);
+  text(widget, remaining(task), level ? 22 : 19, level ? colors.accent : task.overdue ? palette.urgent : palette.green, true);
+  widget.addSpacer(1);
+  text(widget, (task.calendarTimeChanged ? "备注 " : "") + dateText(task.due,
+    beijingParts(task.due).year !== beijingParts(now).year) + (task.kind === "lecture" ? " 上课" : " 截止"), 10, colors.secondary);
   if (task.start) {
     widget.addSpacer(2);
-    text(widget, examStart(task, false), 9, palette.secondary);
+    text(widget, examStart(task, false), 9, colors.secondary);
   } else if (midnightNote(task)) {
     widget.addSpacer(2);
-    text(widget, midnightNote(task), 9, palette.secondary);
+    text(widget, midnightNote(task), 9, colors.secondary);
   }
-  widget.addSpacer();
-  if (overdueCount && !task.overdue) text(widget, `另有 ${overdueCount} 项逾期`, 9, palette.urgent);
-  else text(widget, `读取 ${timeText(now)}`, 9, palette.secondary);
 }
 function message(widget, title, body, family) {
   widget.addSpacer();
@@ -228,10 +367,11 @@ function message(widget, title, body, family) {
   text(widget, body, family === "small" ? 10 : 12, palette.secondary, false, family === "small" ? 5 : 6);
   widget.addSpacer();
 }
-function makeWidget(tasks, family, error, calendarId) {
+function makeWidget(tasks, family, error, calendarId, readAt, invalidCount = 0) {
   const widget = new ListWidget();
   widget.backgroundColor = palette.background;
-  widget.setPadding(family === "small" ? 10 : 14, 14, family === "small" ? 8 : 12, 14);
+  widget.setPadding(family === "small" ? 8 : family === "medium" ? 10 : 14, 14,
+    family === "small" ? 6 : family === "medium" ? 8 : 12, 14);
   widget.refreshAfterDate = new Date(now.getTime() + 15 * 60000);
   // Scriptable 官方 URL：点击打开脚本预览，不修改日历，也不访问本地 Mac 服务。
   const runURL = URLScheme.forRunningScript();
@@ -239,10 +379,19 @@ function makeWidget(tasks, family, error, calendarId) {
     (calendarId ? `&calendarId=${encodeURIComponent(calendarId)}` : "");
   const future = tasks.filter(task => !task.overdue).sort((a, b) => a.due - b.due);
   const past = tasks.filter(task => task.overdue).sort((a, b) => b.due - a.due);
-  header(widget, family, future.length, past.length);
-  if (error) { message(widget, "需要检查日历", error, family); return widget; }
+  const smallColors = !error && family === "small" && future.length && urgency(future[0]) ? taskColors(future[0]) : null;
+  if (smallColors) widget.backgroundColor = smallColors.background;
+  header(widget, family, error ? [] : future, error ? 0 : past.length, smallColors);
+  if (error) {
+    message(widget, "需要检查日历", error, family);
+    syncFooter(widget, [], family, null);
+    return widget;
+  }
   if (!tasks.length) {
-    message(widget, "近期没有课期待办", "查询范围：过去 30 天至未来 60 天。以本机已收到的日历记录为准。", family);
+    message(widget, invalidCount ? "有记录需要核对" : "近期没有课期待办", invalidCount ?
+      `${invalidCount} 项课期记录格式异常。请检查日历备注，或在 Mac 程序核对后同步。` :
+      "查询范围：过去 30 天至未来 60 天。以本机已收到的日历记录为准。", family);
+    syncFooter(widget, tasks, family, readAt, palette.secondary, "", invalidCount);
     return widget;
   }
   const capacity = { small: 1, medium: 3, large: 5, extraLarge: 8 }[family];
@@ -250,8 +399,14 @@ function makeWidget(tasks, family, error, calendarId) {
   if (!future.length || family === "large" || family === "extraLarge") {
     visible = visible.concat(past.slice(0, capacity - visible.length));
   }
-  if (family === "small") { smallBody(widget, visible[0], past.length); return widget; }
-  widget.addSpacer(family === "medium" ? 7 : 12);
+  if (family === "small") {
+    smallBody(widget, visible[0]);
+    widget.addSpacer();
+    const suffix = past.length && !visible[0].overdue ? ` · 逾期 ${past.length}` : "";
+    syncFooter(widget, tasks, family, readAt, taskColors(visible[0]).secondary, suffix, invalidCount);
+    return widget;
+  }
+  widget.addSpacer(family === "medium" ? 5 : 12);
   if (!future.length && family !== "medium") {
     text(widget, "未来 60 天暂无待办 · 以下为逾期记录", 10, palette.urgent);
     widget.addSpacer(5);
@@ -270,24 +425,22 @@ function makeWidget(tasks, family, error, calendarId) {
   } else {
     visible.forEach((task, index) => {
       compactRow(widget, task, family);
-      if (index < visible.length - 1) widget.addSpacer(family === "medium" ? 6 : 10);
+      if (index < visible.length - 1) widget.addSpacer(family === "medium" ? 4 : 10);
     });
   }
   widget.addSpacer();
   const remainingCount = Math.max(0, future.length + past.length - visible.length);
-  const footer = family === "medium" ?
-    `北京时间 · 读取 ${timeText(now)}${remainingCount ? ` · 另 ${remainingCount} 项` : ""}` :
-    `北京时间 · 读取 ${dateText(now)} · 逾期统计近 30 天${remainingCount ? ` · 另 ${remainingCount} 项` : ""}`;
-  text(widget, footer, 9, palette.secondary);
+  syncFooter(widget, tasks, family, readAt, palette.secondary,
+    remainingCount ? ` · 另 ${remainingCount} 项` : "", invalidCount);
   return widget;
 }
 
 let settings = { family: config.widgetFamily || PREVIEW_SIZE, calendarId: "" };
-let tasks = [], error = "";
-try { settings = options(); tasks = await readTasks(settings.calendarId); }
+let tasks = [], error = "", readAt = null, invalidCount = 0;
+try { settings = options(); ({ tasks, readAt, invalidCount } = await readTasks(settings.calendarId)); }
 catch (failure) { error = failure && failure.message ? failure.message : "读取失败，请在 Scriptable 内运行并检查日历权限。"; }
 if (!["small", "medium", "large", "extraLarge"].includes(settings.family)) settings.family = "medium";
-const widget = makeWidget(tasks, settings.family, error, settings.calendarId);
+const widget = makeWidget(tasks, settings.family, error, settings.calendarId, readAt, invalidCount);
 Script.setWidget(widget);
 if (config.runsInApp) {
   if (settings.family === "small") await widget.presentSmall();
