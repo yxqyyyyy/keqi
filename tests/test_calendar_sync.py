@@ -136,7 +136,7 @@ class CalendarSyncTests(unittest.TestCase):
 
     def test_event_layout_policy_migrates_unchanged_tasks(self):
         tasks = self.store.tasks()
-        with patch("studyreminder.calendar_sync.EVENT_LAYOUT_VERSION", 1):
+        with patch("studyreminder.calendar_sync.EVENT_LAYOUT_VERSION", 2):
             self.store.set_value("synced_signature", self.sync.signature(tasks))
         self.assertTrue(self.sync.info()["needs_sync"])
         with patch("studyreminder.calendar_sync.subprocess.run", return_value=self.result()):
@@ -187,25 +187,37 @@ class NativeCalendarPolicyTests(unittest.TestCase):
         return {"id": "math-contest", "title": "大数竞", "course": "高数", "source": "manual", "kind": "exam",
                 "start_at": "2026-11-14T09:00:00+08:00", "due_at": "2026-11-14T11:30:00+08:00", **changes}
 
-    def test_manual_exam_shows_real_sitting_without_moving_deadline_alerts(self):
+    def test_manual_exam_reminds_before_start_and_preserves_end(self):
         task = self.preview([self.exam()])["tasks"][0]
         self.assertEqual(task["event_start"], "2026-11-14T01:00:00Z")
         self.assertEqual(task["event_end"], "2026-11-14T03:30:00Z")
-        self.assertEqual(task["reminder_at"], ["2026-11-12T03:30:00Z", "2026-11-13T03:30:00Z", "2026-11-14T01:30:00Z"])
-        self.assertEqual(task["reminder_offsets"], [-163800, -77400, 1800])
+        self.assertEqual(task["reminder_at"], ["2026-11-12T01:00:00Z", "2026-11-13T01:00:00Z", "2026-11-13T23:00:00Z"])
+        self.assertEqual(task["reminder_offsets"], [-172800, -86400, -7200])
+        self.assertEqual(task["reminder_anchor"], "2026-11-14T01:00:00Z")
+        self.assertTrue(task["reminder_eligible"])
         self.assertIn("截止时间：2026-11-14 11:30（北京时间）", task["notes"])
         self.assertIn("考试开始：2026-11-14 09:00（北京时间）", task["notes"])
+        self.assertIn("提醒基准：考试开始", task["notes"])
 
-    def test_platform_or_legacy_exam_keeps_deadline_placeholder(self):
+    def test_platform_or_legacy_exam_also_reminds_before_start(self):
         for source in ("chaoxing", "xiji", None):
             with self.subTest(source=source):
                 item = self.exam(source=source)
                 if source is None:
                     del item["source"]
                 task = self.preview([item])["tasks"][0]
-                self.assertEqual(task["event_start"], "2026-11-14T03:30:00Z")
-                self.assertEqual(task["event_end"], "2026-11-14T03:45:00Z")
+                self.assertEqual(task["event_start"], "2026-11-14T01:00:00Z")
+                self.assertEqual(task["event_end"], "2026-11-14T03:30:00Z")
                 self.assertEqual(task["reminder_offsets"], [-172800, -86400, -7200])
+                self.assertEqual(task["reminder_at"], ["2026-11-12T01:00:00Z", "2026-11-13T01:00:00Z", "2026-11-13T23:00:00Z"])
+
+    def test_changing_exam_end_does_not_move_start_based_reminders(self):
+        original = self.preview([self.exam()])["tasks"][0]
+        extended = self.preview([self.exam(due_at="2026-11-14T12:30:00+08:00")])["tasks"][0]
+        self.assertEqual(original["event_start"], extended["event_start"])
+        self.assertEqual(original["reminder_anchor"], extended["reminder_anchor"])
+        self.assertEqual(original["reminder_at"], extended["reminder_at"])
+        self.assertEqual(extended["event_end"], "2026-11-14T04:30:00Z")
 
     def test_assignment_and_lecture_do_not_become_exam_intervals(self):
         for kind in ("assignment", "lecture"):
@@ -215,13 +227,36 @@ class NativeCalendarPolicyTests(unittest.TestCase):
                 self.assertEqual(task["event_end"], "2026-11-14T03:45:00Z")
                 self.assertEqual(task["reminder_offsets"], [-172800, -86400, -7200])
 
-    def test_missing_or_nonpositive_exam_interval_keeps_deadline_placeholder(self):
-        for start in (None, "", "2026-11-14T11:30:00+08:00", "2026-11-14T12:00:00+08:00"):
+    def test_missing_exam_start_has_no_end_based_reminder(self):
+        for start in (None, ""):
             with self.subTest(start=start):
-                task = self.preview([self.exam(start_at=start)])["tasks"][0]
-                self.assertEqual(task["event_start"], "2026-11-14T03:30:00Z")
-                self.assertEqual(task["event_end"], "2026-11-14T03:45:00Z")
-                self.assertEqual(task["reminder_offsets"], [-172800, -86400, -7200])
+                result = self.preview([self.exam(start_at=start)])
+                task = result["tasks"][0]
+                self.assertIsNone(task["reminder_anchor"])
+                self.assertFalse(task["reminder_eligible"])
+                self.assertFalse(task["pending"])
+                self.assertEqual(task["reminder_offsets"], [])
+                self.assertEqual(task["reminder_at"], [])
+                self.assertIn("缺少开考时间", task["warning"])
+                self.assertEqual(result["warnings"], [task["warning"]])
+
+    def test_equal_start_and_end_has_start_based_reminder_and_short_event(self):
+        task = self.preview([self.exam(start_at="2026-11-14T11:30:00+08:00")])["tasks"][0]
+        self.assertEqual(task["event_start"], "2026-11-14T03:30:00Z")
+        self.assertEqual(task["event_end"], "2026-11-14T03:45:00Z")
+        self.assertEqual(task["reminder_anchor"], "2026-11-14T03:30:00Z")
+        self.assertTrue(task["reminder_eligible"])
+        self.assertEqual(task["reminder_offsets"], [-172800, -86400, -7200])
+
+    def test_completed_exam_missing_start_does_not_warn_or_schedule(self):
+        result = self.preview([self.exam(start_at=None, status="completed")])
+        self.assertFalse(result["tasks"][0]["reminder_eligible"])
+        self.assertEqual(result["tasks"][0]["reminder_at"], [])
+        self.assertEqual(result["warnings"], [])
+
+    def test_exam_start_after_end_fails_before_accessing_calendar(self):
+        result = self.preview([self.exam(start_at="2026-11-14T12:00:00+08:00")], ok=False)
+        self.assertIn("开始时间不能晚于结束时间", result["message"])
 
     def test_invalid_exam_start_fails_before_accessing_calendar(self):
         result = self.preview([self.exam(start_at="invalid")], ok=False)

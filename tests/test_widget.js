@@ -4,8 +4,10 @@ const path = require('path');
 const assert = require('assert');
 const source = fs.readFileSync(process.argv[2] || path.join(__dirname, '../widgets/课期.js'), 'utf8');
 const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+const DEFAULT_NOW = '2026-10-16T02:00:00Z';
+let mockNow = DEFAULT_NOW;
 class FixedDate extends Date {
-  constructor(...values) { super(...(values.length ? values : ['2026-10-16T02:00:00Z'])); }
+  constructor(...values) { super(...(values.length ? values : [mockNow])); }
 }
 class Stack {
  constructor() { this.items = []; }
@@ -34,7 +36,8 @@ function event(title, due, opts={}) {
    (Object.prototype.hasOwnProperty.call(opts, 'platformAttempt') ? '\n平台最近尝试同步：' + opts.platformAttempt : '') +
    (Object.prototype.hasOwnProperty.call(opts, 'platformResult') ? '\n平台同步结果：' + opts.platformResult : '')};
 }
-async function run({family='medium', parameter=null, calendars=[{title:'作业与考试',identifier:'target'}], events=[], readError=false, permissionError=false, inApp=false, query={}, dark=false}={}) {
+async function run({family='medium', parameter=null, calendars=[{title:'作业与考试',identifier:'target'}], events=[], readError=false, permissionError=false, inApp=false, query={}, dark=false, now=DEFAULT_NOW}={}) {
+ mockNow = now;
  const state = {completed:false, alerts:0};
  class AppearanceColor extends Color { static dynamic(light,night){ return dark ? night : light; } }
  class Alert { addAction(){} async presentAlert(){state.alerts++;} }
@@ -45,6 +48,7 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
   {widgetParameter:parameter,queryParameters:query}, {widgetFamily:inApp?null:family,runsInApp:inApp},
   {setWidget:w=>state.widget=w,complete:()=>state.completed=true}, Alert, FixedDate);
  assert(state.completed);
+ mockNow = DEFAULT_NOW;
  return {...state,text:strings(state.widget).join('\n')};
 }
 (async()=>{
@@ -66,7 +70,7 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
  r=await run({parameter:'{"bad'});assert(r.text.includes('不是有效 JSON'));checks++;
  const broken=event('格式有错','2026-10-18T09:50:00+08:00');broken.startDate=new FixedDate('2026-10-19T09:50:00+08:00');r=await run({events:[broken]});assert(r.text.includes('时间待核对'));assert(r.text.includes('备注截止 10/18 09:50'));assert(!r.text.includes('需要检查日历'));checks++;
  r=await run({family:'small',events:[event('固定线下作业','2026-10-18T00:00:00+08:00',{course:'大学物理',offline:true})]});assert(r.text.includes('10/18 00:00'));assert(r.text.includes('周六 24:00'));checks++;
- r=await run({events:[event('磁学单元测验','2026-10-18T16:20:00+08:00',{course:'大学物理',kind:'exam',start:'2026-10-18T14:00:00+08:00'})]});assert(r.text.includes('14:00 开考'));assert(r.text.includes('10/18 16:20'));checks++;
+ r=await run({events:[event('磁学单元测验','2026-10-18T16:20:00+08:00',{course:'大学物理',kind:'exam',start:'2026-10-18T14:00:00+08:00'})]});assert(r.text.includes('14:00 开考'));assert(r.text.includes('16:20 结束'));checks++;
  r=await run({events:[event('作业3-1','2026-10-21T09:50:00+08:00',{kind:'assignment',start:'2026-10-14T12:15:00+08:00'})]});assert(!r.text.includes('开考'));assert(!r.text.includes('12:15'));assert(r.text.includes('10/21 09:50'));checks++;
  r=await run({inApp:true,query:{preview:'large'},events:future});assert.equal(r.widget.presented,'large');checks++;
  r=await run({family:'small',parameter:'large',events:future});assert(r.text.includes('逾期')===false);assert(r.text.includes('课期'));assert(!r.text.includes('较晚'));checks++;
@@ -116,7 +120,7 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
  assert(nodes(r.widget).some(node=>node.backgroundColor?.value==='583218'));
  checks++;
  // Exams and offline work must not claim an online homework submission status.
- r=await run({events:[event('快截止的考试','2026-10-16T12:00:00+08:00',{kind:'exam',course:'大学物理'}), pending24]});
+ r=await run({events:[event('快截止的考试','2026-10-16T12:00:00+08:00',{kind:'exam',course:'大学物理',start:'2026-10-16T12:00:00+08:00'}), pending24]});
  assert(r.text.includes('24h 待交 1 · 待考 1'));
  assert(r.text.includes('大学物理')===false); // existing short course display uses 大物
  assert(r.text.includes('大物 · 待考 · 快截止的考试'));
@@ -232,7 +236,7 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
    assert(r.text.includes(family==='small'?'10/16 12:00 上课':'上课 10/16 12:00'));
    checks++;
  }
- r=await run({events:[pending24,lecture,event('测验','2026-10-16T12:00:00+08:00',{kind:'exam'})]});
+ r=await run({events:[pending24,lecture,event('测验','2026-10-16T12:00:00+08:00',{kind:'exam',start:'2026-10-16T12:00:00+08:00'})]});
  assert(r.text.includes('24h 待交 1 · 待考 1 · 上课 1'));checks++;
  r=await run({family:'small',events:[event('刚开始的课','2026-10-16T10:00:00+08:00',{kind:'lecture'})]});
  assert(r.text.includes('现在上课'));assert(!r.text.includes('现在截止'));checks++;
@@ -241,14 +245,14 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
  const badLecture=event('时间有错的课','2026-10-16T12:00:00+08:00',{kind:'lecture'});
  badLecture.startDate=new FixedDate('2026-10-16T13:00:00+08:00');
  r=await run({events:[badLecture]});assert(r.text.includes('备注上课 10/16 12:00'));assert(r.text.includes('时间待核对'));checks++;
- // Editing a deadline placeholder into the real exam interval must retain 11:30 as the deadline.
+ // Both old placeholders and real event intervals use the recorded exam start for reminders.
  const competition=event('大学生数学竞赛','2026-11-14T11:30:00+08:00',
    {kind:'exam',course:'高数',start:'2026-11-14T09:00:00+08:00'});
  competition.startDate=new FixedDate('2026-11-14T09:00:00+08:00');
  competition.endDate=new FixedDate('2026-11-14T11:30:00+08:00');
  for(const family of ['small','medium','large','extraLarge']) {
    r=await run({family,events:[competition]});
-   assert(r.text.includes('大学生数学竞赛'));assert(r.text.includes('11/14 11:30'));
+   assert(r.text.includes('大学生数学竞赛'));assert(r.text.includes('11:30 结束'));
    assert(r.text.includes('09:00 开考'));assert(!/需要检查日历|时间待核对|备注截止/.test(r.text));
    checks++;
  }
@@ -257,7 +261,66 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
  r=await run({events:[changedCompetition,...future]});
  assert(r.text.includes('下一项'));assert(r.text.includes('1 项时间待核对'));assert(!r.text.includes('需要检查日历'));checks++;
  r=await run({family:'small',events:[changedCompetition]});
- assert(r.text.includes('备注 11/14 11:30 截止'));assert(!r.text.includes('12:30'));checks++;
+ assert(r.text.includes('备注 11/14 09:00 开考'));assert(!r.text.includes('12:30'));checks++;
+ // The countdown, exact 24h/2h boundaries and card colours all use 09:00, independent of 11:30 end.
+ for(const family of ['small','medium','large','extraLarge']) {
+   for(const [now,label,background,urgent] of [
+     ['2026-11-14T08:00:00+08:00','剩 1 小时','AB242C',true],
+     ['2026-11-14T07:00:00+08:00','剩 2 小时','AB242C',true],
+     ['2026-11-14T06:59:00+08:00','剩 3 小时','FFE2BA',true],
+     ['2026-11-13T09:00:00+08:00','剩 24 小时','FFE2BA',true],
+     ['2026-11-13T08:59:00+08:00','剩 25 小时','F7F7F0',false],
+     ['2026-11-14T09:00:00+08:00','现在开考','AB242C',true]]) {
+     r=await run({family,events:[competition],now});
+     assert(r.text.includes(label),`${family} at ${now}: ${r.text}`);
+     assert(r.text.includes('09:00 开考'));assert(r.text.includes('11:30 结束'));
+     assert.equal(r.text.includes('24h 待考 1'),urgent);
+     if(family==='small') assert.equal(r.widget.backgroundColor.value,background);
+     else if(urgent) assert(nodes(r.widget).some(node=>node.backgroundColor?.value===background));
+     assert(!/尽快提交|逾期|截止/.test(r.text));checks++;
+   }
+   for(const [now,label] of [['2026-11-14T09:01:00+08:00','考试中'],
+       ['2026-11-14T11:30:00+08:00','已结束']]) {
+     r=await run({family,events:[competition],now});
+     assert(r.text.includes(label));assert(r.text.includes('大学生数学竞赛'));
+     assert(!/24h 待考|待考 ·|逾期|剩 3 小时/.test(r.text));
+     assert.equal(r.widget.backgroundColor.value,'F7F7F0');checks++;
+   }
+ }
+ // A missing start stays visible without using a near end time as an alarm anchor.
+ const missingStart=event('缺少开考时间的考试','2026-11-14T11:30:00+08:00',{kind:'exam',course:'高数'});
+ for(const family of ['small','medium','large','extraLarge']) {
+   r=await run({family,events:[missingStart],now:'2026-11-14T10:00:00+08:00'});
+   assert(r.text.includes('开考时间待补充'));assert(r.text.includes('11:30 结束'));
+   assert(!/24h 待考|剩 |逾期|截止/.test(r.text));
+   assert.equal(r.widget.backgroundColor.value,'F7F7F0');checks++;
+ }
+ // Earlier start takes precedence over an assignment ending before this exam ends.
+ const laterAssignment=event('十点作业','2026-11-14T10:00:00+08:00');
+ for(const family of ['small','medium','large','extraLarge']) {
+   r=await run({family,events:[laterAssignment,competition],now:'2026-11-14T08:00:00+08:00'});
+   assert(r.text.includes('大学生数学竞赛'));
+   if(family==='small') assert(!r.text.includes('十点作业'));
+   else assert(r.text.indexOf('大学生数学竞赛')<r.text.indexOf('十点作业'));
+   r=await run({family,events:[laterAssignment,competition],now:'2026-11-14T09:30:00+08:00'});
+   assert(r.text.includes('考试中'));assert(!/24h 待考/.test(r.text));checks++;
+ }
+ // The previous deadline placeholder and the new instant-exam placeholder are both supported.
+ const oldCompetition={...competition,startDate:new FixedDate('2026-11-14T11:30:00+08:00'),
+   endDate:new FixedDate('2026-11-14T11:45:00+08:00')};
+ const instantExam=event('同刻考试','2026-11-14T09:00:00+08:00',
+   {kind:'exam',start:'2026-11-14T09:00:00+08:00'});
+ instantExam.endDate=new FixedDate('2026-11-14T09:15:00+08:00');
+ for(const value of [oldCompetition,instantExam]) {
+   r=await run({family:'small',events:[value],now:'2026-11-14T08:00:00+08:00'});
+   assert(r.text.includes('剩 1 小时'));assert(!r.text.includes('时间待核对'));checks++;
+ }
+ // Invalid order is isolated and never becomes a countdown to the end time.
+ const reverseExam=event('开考晚于结束','2026-11-14T09:00:00+08:00',
+   {kind:'exam',start:'2026-11-14T11:30:00+08:00'});
+ r=await run({events:[reverseExam,laterAssignment],now:'2026-11-14T08:00:00+08:00'});
+ assert(r.text.includes('十点作业'));assert(r.text.includes('1 项异常'));
+ assert(!r.text.includes('开考晚于结束'));checks++;
  // Bad metadata must not blank other classes, nor report successful full coverage or an empty task list.
  const invalid=event('损坏的记录','2026-10-18T09:50:00+08:00',{platformSync:'2026-10-16T09:00:00+08:00'});
  invalid.notes=invalid.notes.replace('2026-10-18 09:50','2026-02-30 09:50');

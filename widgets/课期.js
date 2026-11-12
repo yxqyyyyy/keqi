@@ -187,20 +187,25 @@ function taskFromEvent(event) {
   if (startText && !start) {
     throw new Error("存在考试开始时间格式异常的记录。请在 Mac 程序重新同步日历。");
   }
+  if (start && start > due) {
+    throw new Error("存在开考时间晚于结束时间的记录。请在 Mac 程序核对后重新同步日历。");
+  }
   const sameMinute = (a, b) => a instanceof Date && Number.isFinite(a.getTime()) &&
     Math.abs(a.getTime() - b.getTime()) < 60000;
-  // 兼容旧版的截止占位事件，以及手机/新版桥接显示的真实考试区间。
-  // 09:00–11:30 的考试仍在 11:30 截止，不能把日历开始当成截止。
-  const examInterval = kind === "exam" && start && start < due && !event.isAllDay &&
-    sameMinute(originalDue, start) && sameMinute(event.endDate, due);
+  // 读取备注中的开考时刻，同时兼容旧截止占位及新版真实考试区间。
+  const examEnd = start && start.getTime() === due.getTime() ? new Date(start.getTime() + 15 * 60000) : due;
+  const examInterval = kind === "exam" && start && !event.isAllDay &&
+    sameMinute(originalDue, start) && sameMinute(event.endDate, examEnd);
   const calendarTimeChanged = !examInterval && (!sameMinute(originalDue, due) || Boolean(event.isAllDay));
+  const anchor = kind === "exam" ? start : due;
+  const examPhase = kind !== "exam" ? "" : !start ? "missing" : now <= start ? "upcoming" : now < due ? "ongoing" : "ended";
   return { id: event.identifier, course: shortCourse(course), title,
-    kind, due, start, calendarTimeChanged, updated: field(notes, "本地记录更新时间"),
+    kind, due, start, anchor, examPhase, calendarTimeChanged, updated: field(notes, "本地记录更新时间"),
     platformSyncedAt: platformSyncFromNotes(notes),
     platformAttemptedAt: parsePlatformSync(uniqueMetadataField(notes, "平台最近尝试同步")),
     platformSyncResult: platformResultFromNotes(notes),
     offline: /线下|纸质/.test(notes) && /大学物理|大物/.test(course),
-    overdue: due.getTime() < now.getTime() };
+    overdue: kind !== "exam" && due.getTime() < now.getTime() };
 }
 async function readTasks(calendarId) {
   let calendars;
@@ -247,7 +252,8 @@ async function readTasks(calendarId) {
   return { tasks: Array.from(unique.values()), readAt: new Date(), invalidCount };
 }
 function urgency(task) {
-  const left = task.due.getTime() - now.getTime();
+  if (!task.anchor) return 0;
+  const left = task.anchor.getTime() - now.getTime();
   if (task.overdue || left < 0 || left > 24 * 3600000) return 0;
   return left <= 2 * 3600000 ? 2 : 1;
 }
@@ -256,11 +262,15 @@ function taskColors(task) {
   return level ? urgencyPalette[level === 2 ? "critical" : "soon"] : palette;
 }
 function pendingLabel(task) {
-  return task.kind === "lecture" ? "待上课" : task.kind === "exam" ? "待考" : task.offline ? "线下待交" : "待交";
+  if (task.kind === "exam") return { missing: "待补开考时间", ongoing: "考试中", ended: "已结束", upcoming: "待考" }[task.examPhase];
+  return task.kind === "lecture" ? "待上课" : task.offline ? "线下待交" : "待交";
 }
 function remaining(task) {
-  if (task.due.getTime() === now.getTime()) return task.kind === "lecture" ? "现在上课" : "现在截止";
-  const ms = Math.abs(task.due.getTime() - now.getTime());
+  if (!task.anchor) return "开考时间待补充";
+  if (task.anchor.getTime() === now.getTime()) return task.kind === "exam" ? "现在开考" : task.kind === "lecture" ? "现在上课" : "现在截止";
+  if (task.kind === "exam" && task.examPhase === "ongoing") return "考试中";
+  if (task.kind === "exam" && task.examPhase === "ended") return "已结束";
+  const ms = Math.abs(task.anchor.getTime() - now.getTime());
   let label;
   if (ms < 3600000) label = `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
   else if (ms < 48 * 3600000) label = `${Math.ceil(ms / 3600000)} 小时`;
@@ -268,15 +278,16 @@ function remaining(task) {
   return `${task.overdue ? task.kind === "lecture" ? "已开始 " : "逾期 " : "剩 "}${label}`;
 }
 function deadline(task) {
-  const year = beijingParts(task.due).year !== beijingParts(now).year;
+  if (!task.anchor) return "开考时间待补充";
+  const year = beijingParts(task.anchor).year !== beijingParts(now).year;
+  if (task.kind === "exam") return (task.calendarTimeChanged ? "备注 " : "") + dateText(task.anchor, year) + " 开考";
   const prefix = task.kind === "lecture" ? task.overdue ? "已开始 " : "上课 " : task.overdue ? "已过截止 " : "截止 ";
   return (task.calendarTimeChanged ? "备注" : "") + prefix + dateText(task.due, year);
 }
-function examStart(task, compact) {
-  if (!task.start) return "";
-  const same = dateStamp(task.start) === dateStamp(task.due);
-  return `${compact && same ? timeText(task.start) : dateText(task.start,
-    beijingParts(task.start).year !== beijingParts(now).year)} 开考`;
+function examEnd(task, compact) {
+  const same = task.start && dateStamp(task.start) === dateStamp(task.due);
+  return `${compact && same ? timeText(task.due) : dateText(task.due,
+    beijingParts(task.due).year !== beijingParts(now).year)} 结束`;
 }
 function midnightNote(task) {
   const p = beijingParts(task.due);
@@ -290,7 +301,7 @@ function text(container, value, size, color = palette.ink, bold = false, lines =
   element.minimumScaleFactor = 0.85;
   return element;
 }
-function header(widget, family, future, overdueCount, smallColors) {
+function header(widget, family, future, overdueCount, smallColors, activeCount = 0, missingCount = 0) {
   const row = widget.addStack();
   row.centerAlignContent();
   text(row, "课期", family === "small" ? 15 : 16, smallColors ? smallColors.ink : palette.green, true);
@@ -310,8 +321,9 @@ function header(widget, family, future, overdueCount, smallColors) {
     text(badge, `24h ${counts}`, family === "small" ? 10 : 12, colors.ink, true);
     return;
   }
-  const summary = family === "small" ? "北京时间" : future.length === 0 && overdueCount > 0 ?
-    `未来暂无 · 逾期 ${overdueCount}` : `待办 ${future.length}${overdueCount ? ` · 逾期 ${overdueCount}` : ""}`;
+  const summary = family === "small" ? "北京时间" : future.length === 0 && overdueCount > 0 && !activeCount && !missingCount ?
+    `未来暂无 · 逾期 ${overdueCount}` : `待办 ${future.length}${activeCount ? ` · 考试中 ${activeCount}` : ""}` +
+    `${missingCount ? ` · 待补 ${missingCount}` : ""}${overdueCount ? ` · 逾期 ${overdueCount}` : ""}`;
   text(row, summary, 10, overdueCount ? palette.urgent : palette.secondary);
 }
 function compactRow(container, task, family) {
@@ -332,7 +344,7 @@ function compactRow(container, task, family) {
   text(top, remaining(task), level ? 12 : 10, level ? colors.accent : task.overdue ? palette.urgent : palette.green, Boolean(level));
   row.addSpacer(2);
   const cue = level === 2 && task.kind === "assignment" ? "尽快提交 · " : "";
-  const second = `${cue}${deadline(task)}${task.start ? " · " + examStart(task, true) : ""}`;
+  const second = `${cue}${deadline(task)}${task.kind === "exam" ? " · " + examEnd(task, true) : ""}`;
   text(row, second, 10, colors.secondary);
   if (family !== "medium") {
     const note = midnightNote(task);
@@ -348,13 +360,13 @@ function smallBody(widget, task) {
   widget.addSpacer(1);
   text(widget, task.title, 14, colors.ink, true, 2);
   widget.addSpacer(2);
-  text(widget, remaining(task), level ? 22 : 19, level ? colors.accent : task.overdue ? palette.urgent : palette.green, true);
+  text(widget, remaining(task), !task.anchor ? 13 : level ? 22 : 19, level ? colors.accent : task.overdue ? palette.urgent : palette.green, true);
   widget.addSpacer(1);
-  text(widget, (task.calendarTimeChanged ? "备注 " : "") + dateText(task.due,
+  text(widget, task.kind === "exam" ? deadline(task) : (task.calendarTimeChanged ? "备注 " : "") + dateText(task.due,
     beijingParts(task.due).year !== beijingParts(now).year) + (task.kind === "lecture" ? " 上课" : " 截止"), 10, colors.secondary);
-  if (task.start) {
+  if (task.kind === "exam") {
     widget.addSpacer(2);
-    text(widget, examStart(task, false), 9, colors.secondary);
+    text(widget, examEnd(task, false), 9, colors.secondary);
   } else if (midnightNote(task)) {
     widget.addSpacer(2);
     text(widget, midnightNote(task), 9, colors.secondary);
@@ -377,11 +389,17 @@ function makeWidget(tasks, family, error, calendarId, readAt, invalidCount = 0) 
   const runURL = URLScheme.forRunningScript();
   widget.url = `${runURL}${runURL.includes("?") ? "&" : "?"}preview=large` +
     (calendarId ? `&calendarId=${encodeURIComponent(calendarId)}` : "");
-  const future = tasks.filter(task => !task.overdue).sort((a, b) => a.due - b.due);
-  const past = tasks.filter(task => task.overdue).sort((a, b) => b.due - a.due);
-  const smallColors = !error && family === "small" && future.length && urgency(future[0]) ? taskColors(future[0]) : null;
+  const future = tasks.filter(task => task.anchor && !task.overdue && (task.kind !== "exam" || task.examPhase === "upcoming"))
+    .sort((a, b) => a.anchor - b.anchor);
+  const active = tasks.filter(task => task.examPhase === "ongoing").sort((a, b) => a.anchor - b.anchor);
+  const missing = tasks.filter(task => task.kind === "exam" && !task.anchor);
+  const past = tasks.filter(task => task.overdue || task.examPhase === "ended").sort((a, b) => b.anchor - a.anchor);
+  const overdueCount = past.filter(task => task.overdue).length;
+  const primary = [...active, ...future, ...missing];
+  const smallColors = !error && family === "small" && primary.length && urgency(primary[0]) ? taskColors(primary[0]) : null;
   if (smallColors) widget.backgroundColor = smallColors.background;
-  header(widget, family, error ? [] : future, error ? 0 : past.length, smallColors);
+  header(widget, family, error ? [] : future, error ? 0 : overdueCount, smallColors,
+    error ? 0 : active.length, error ? 0 : missing.length);
   if (error) {
     message(widget, "需要检查日历", error, family);
     syncFooter(widget, [], family, null);
@@ -395,20 +413,20 @@ function makeWidget(tasks, family, error, calendarId, readAt, invalidCount = 0) 
     return widget;
   }
   const capacity = { small: 1, medium: 3, large: 5, extraLarge: 8 }[family];
-  let visible = future.slice(0, capacity);
-  if (!future.length || family === "large" || family === "extraLarge") {
+  let visible = primary.slice(0, capacity);
+  if (!primary.length || family === "large" || family === "extraLarge") {
     visible = visible.concat(past.slice(0, capacity - visible.length));
   }
   if (family === "small") {
     smallBody(widget, visible[0]);
     widget.addSpacer();
-    const suffix = past.length && !visible[0].overdue ? ` · 逾期 ${past.length}` : "";
+    const suffix = overdueCount && !visible[0].overdue ? ` · 逾期 ${overdueCount}` : "";
     syncFooter(widget, tasks, family, readAt, taskColors(visible[0]).secondary, suffix, invalidCount);
     return widget;
   }
   widget.addSpacer(family === "medium" ? 5 : 12);
-  if (!future.length && family !== "medium") {
-    text(widget, "未来 60 天暂无待办 · 以下为逾期记录", 10, palette.urgent);
+  if (!primary.length && family !== "medium") {
+    text(widget, "未来 60 天暂无待办 · 以下为往期记录", 10, palette.urgent);
     widget.addSpacer(5);
   }
   if (family === "extraLarge") {
@@ -429,7 +447,7 @@ function makeWidget(tasks, family, error, calendarId, readAt, invalidCount = 0) 
     });
   }
   widget.addSpacer();
-  const remainingCount = Math.max(0, future.length + past.length - visible.length);
+  const remainingCount = Math.max(0, tasks.length - visible.length);
   syncFooter(widget, tasks, family, readAt, palette.secondary,
     remainingCount ? ` · 另 ${remainingCount} 项` : "", invalidCount);
   return widget;

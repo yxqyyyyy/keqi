@@ -11,7 +11,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
-from .scheduling import REMINDER_HOURS, validate_daily_time
+from .scheduling import REMINDER_HOURS, task_anchor, validate_daily_time
 
 TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_SETTINGS = {
@@ -287,7 +287,7 @@ class Store:
         self.ensure_physics()
         with self.connect() as db:
             result = [json.loads(row[0]) for row in db.execute("SELECT body FROM tasks")]
-        return sorted(result, key=lambda t: (parse_datetime(t["due_at"]), t["id"]))
+        return sorted(result, key=lambda t: (task_anchor(t) or datetime.max.replace(tzinfo=TZ), t["id"]))
 
     def get_task(self, task_id):
         with self.connect() as db:
@@ -429,7 +429,14 @@ def to_ics(tasks, platform_synced_at=None, platform_sync_attempted_at=None, plat
     for item in tasks:
         if item["status"] != "pending":
             continue
+        anchor = task_anchor(item)
+        if anchor is None:
+            # Keep the task in the application until its start is confirmed;
+            # exporting an exam at its end would create the wrong reminders.
+            continue
+        start = anchor.astimezone(timezone.utc)
         due = parse_datetime(item["due_at"]).astimezone(timezone.utc)
+        end = due if item.get("kind") == "exam" and due > start else start + timedelta(minutes=15)
         description = item.get("notes", "")
         metadata = []
         if platform_synced_at:
@@ -442,11 +449,13 @@ def to_ics(tasks, platform_synced_at=None, platform_sync_attempted_at=None, plat
         if item.get("kind") == "lecture":
             description += "\n类型：lecture\n上课时间：" + parse_datetime(item["due_at"]).strftime("%Y-%m-%d %H:%M 北京时间")
             description += "\n仅记录开课时间；日历事件时长为提醒占位，不代表课长。"
-        elif item.get("start_at"):
-            description += "\n考试开始：" + parse_datetime(item["start_at"]).strftime("%Y-%m-%d %H:%M 北京时间")
+        elif item.get("kind") == "exam":
+            description += "\n考试开始：" + anchor.strftime("%Y-%m-%d %H:%M 北京时间")
+            description += "\n考试结束：" + parse_datetime(item["due_at"]).strftime("%Y-%m-%d %H:%M 北京时间")
+            description += "\n提醒基准：考试开始"
         lines += ["BEGIN:VEVENT", "UID:" + item["id"] + "@study-deadline.local", "DTSTAMP:" + stamp,
-                  "DTSTART:" + due.strftime("%Y%m%dT%H%M%SZ"),
-                  "DTEND:" + (due + timedelta(minutes=15)).strftime("%Y%m%dT%H%M%SZ"),
+                  "DTSTART:" + start.strftime("%Y%m%dT%H%M%SZ"),
+                  "DTEND:" + end.strftime("%Y%m%dT%H%M%SZ"),
                   "SUMMARY:" + ics_escape((item["course"] + " · " if item.get("course") else "") + item["title"]),
                   "DESCRIPTION:" + ics_escape(description)]
         if item.get("url"):

@@ -10,7 +10,7 @@ from .core import now_iso
 from .scheduling import REMINDER_HOURS
 from .sync_status import sync_signature
 
-EVENT_LAYOUT_VERSION = 2
+EVENT_LAYOUT_VERSION = 3
 
 
 class CalendarSync:

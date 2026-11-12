@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from studyreminder.scheduling import TZ, daily_due, reminder_recheck_keys, validate_daily_time
+from studyreminder.scheduling import TZ, daily_due, reminder_recheck_keys, task_anchor, validate_daily_time
 
 
 def pending_task(**changes):
@@ -122,6 +122,64 @@ class ReminderRecheckTests(unittest.TestCase):
     def test_naive_now_is_rejected(self):
         with self.assertRaises(ValueError):
             reminder_recheck_keys([self.task], datetime(2026, 10, 19, 9, 49), set())
+
+
+class ExamStartReminderTests(unittest.TestCase):
+    def setUp(self):
+        self.task = pending_task(kind="exam", start_at="2026-11-14T09:00:00+08:00",
+                                 due_at="2026-11-14T11:30:00+08:00")
+        self.start = datetime(2026, 11, 14, 9, tzinfo=TZ)
+
+    def key(self, hours, start="2026-11-14T09:00:00+08:00"):
+        return f"task-1|exam-start:{start}|{hours}"
+
+    def test_all_three_prechecks_use_exam_start_and_not_exam_end(self):
+        for hours in (48, 24, 2):
+            with self.subTest(hours=hours):
+                at = self.start - timedelta(hours=hours, minutes=5)
+                self.assertEqual(reminder_recheck_keys([self.task], at, set()), {self.key(hours)})
+                end_based = datetime(2026, 11, 14, 11, 30, tzinfo=TZ) - timedelta(hours=hours, minutes=5)
+                self.assertEqual(reminder_recheck_keys([self.task], end_based, set()), set())
+
+    def test_final_two_hour_precheck_is_before_opening_not_closing(self):
+        at = self.start - timedelta(hours=2, minutes=2)
+        initial = self.key(2)
+        self.assertEqual(reminder_recheck_keys([self.task], at, {initial}), {initial + "|final"})
+        self.assertEqual(reminder_recheck_keys([self.task], at, {initial, initial + "|final"}), set())
+
+    def test_start_change_gets_new_key_and_old_deadline_keys_do_not_suppress_it(self):
+        old_end_key = f"task-1|{self.task['due_at']}|48"
+        self.assertEqual(reminder_recheck_keys([self.task], self.start - timedelta(hours=48), {old_end_key}),
+                         {self.key(48)})
+        changed = {**self.task, "start_at": "2026-11-14T10:00:00+08:00"}
+        self.assertEqual(reminder_recheck_keys([changed], self.start - timedelta(hours=47), {self.key(48)}),
+                         {self.key(48, changed["start_at"])})
+
+    def test_end_only_change_keeps_same_reminder_and_checked_key(self):
+        changed = {**self.task, "due_at": "2026-11-14T12:30:00+08:00"}
+        at = self.start - timedelta(hours=24, minutes=1)
+        self.assertEqual(reminder_recheck_keys([changed], at, set()), {self.key(24)})
+        self.assertEqual(reminder_recheck_keys([changed], at, {self.key(24)}), set())
+
+    def test_missing_or_invalid_exam_start_never_uses_end_time(self):
+        at = datetime(2026, 11, 12, 11, 29, tzinfo=TZ)
+        for value in (None, "", "invalid", 0, "2026-11-14T09:00:00", "2026-11-14T12:00:00+08:00"):
+            item = {**self.task, "start_at": value}
+            with self.subTest(start=value):
+                self.assertIsNone(task_anchor(item))
+                self.assertEqual(reminder_recheck_keys([item], at, set()), set())
+
+    def test_utc_start_is_normalized_and_equal_start_end_is_valid(self):
+        item = {**self.task, "start_at": "2026-11-14T01:00:00Z"}
+        self.assertEqual(task_anchor(item), self.start)
+        self.assertEqual(reminder_recheck_keys([item], self.start - timedelta(hours=48), set()), {self.key(48)})
+        self.assertEqual(task_anchor({**self.task, "due_at": self.task["start_at"]}), self.start)
+
+    def test_assignment_and_lecture_continue_using_due_even_with_a_start_field(self):
+        for kind in ("assignment", "lecture"):
+            item = {**self.task, "kind": kind}
+            with self.subTest(kind=kind):
+                self.assertEqual(task_anchor(item), datetime(2026, 11, 14, 11, 30, tzinfo=TZ))
 
 
 if __name__ == "__main__":

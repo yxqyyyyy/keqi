@@ -102,6 +102,74 @@ class DeadlineTests(unittest.TestCase):
         self.assertEqual(item, original)
         self.assertNotIn("平台最近成功同步：", to_ics([item]))
 
+    def test_exam_ics_uses_opening_and_preserves_closing_for_all_sources(self):
+        for source in ("manual", "chaoxing", "xiji"):
+            with self.subTest(source=source):
+                item = self.store.put_task(exam(source=source, start_at="2026-11-14T09:00:00+08:00",
+                                                due_at="2026-11-14T11:30:00+08:00"))
+                before = dict(item)
+                text = to_ics([item]).replace("\r\n ", "")
+                self.assertIn("DTSTART:20261114T010000Z", text)
+                self.assertIn("DTEND:20261114T033000Z", text)
+                self.assertNotIn("DTSTART:20261114T033000Z", text)
+                self.assertIn("考试开始：2026-11-14 09:00 北京时间", text)
+                self.assertIn("考试结束：2026-11-14 11:30 北京时间", text)
+                self.assertIn("提醒基准：考试开始", text)
+                self.assertEqual(text.count("BEGIN:VALARM"), 3)
+                for hours in (48, 24, 2):
+                    self.assertIn(f"TRIGGER:-PT{hours}H", text)
+                self.assertEqual(item, before)
+
+    def test_exam_without_start_stays_pending_but_does_not_export_end_reminders(self):
+        item = self.store.put_task(exam(start_at=None))
+        assignment = self.store.put_task(task(source_key="work:other"))
+        text = to_ics([item, assignment])
+        self.assertNotIn("UID:" + item["id"], text)
+        self.assertIn("UID:" + assignment["id"], text)
+        self.assertEqual(text.count("BEGIN:VALARM"), 3)
+        self.assertEqual(self.store.get_task(item["id"])["status"], "pending")
+        self.assertIsNone(self.store.get_task(item["id"])["start_at"])
+
+    def test_distinct_exams_with_same_start_keep_their_own_end_times(self):
+        first = self.store.put_task(exam(source_key="course:1:exam:2",
+                                        start_at="2026-11-14T09:00:00+08:00",
+                                        due_at="2026-11-14T11:30:00+08:00"))
+        second = self.store.put_task(exam(source_key="course:1:exam:3",
+                                         start_at="2026-11-14T09:00:00+08:00",
+                                         due_at="2026-11-14T12:30:00+08:00"))
+        text = to_ics([first, second])
+        self.assertEqual(text.count("DTSTART:20261114T010000Z"), 2)
+        self.assertIn("DTEND:20261114T033000Z", text)
+        self.assertIn("DTEND:20261114T043000Z", text)
+        self.assertIn("UID:" + first["id"], text)
+        self.assertIn("UID:" + second["id"], text)
+        self.assertEqual(text.count("BEGIN:VALARM"), 6)
+        self.assertEqual(self.store.get_task(first["id"])["due_at"], "2026-11-14T11:30:00+08:00")
+        self.assertEqual(self.store.get_task(second["id"])["due_at"], "2026-11-14T12:30:00+08:00")
+
+    def test_invalid_exam_start_in_raw_export_never_falls_back_to_deadline(self):
+        item = self.store.put_task(exam())
+        for value in ("invalid", "2026-10-17T18:00:00", "2026-10-19T18:00:00+08:00"):
+            with self.subTest(start=value):
+                self.assertNotIn("BEGIN:VEVENT", to_ics([{**item, "start_at": value}]))
+
+    def test_task_order_uses_exam_opening_and_missing_starts_sort_last(self):
+        assignment = self.store.put_task(task(source_key="order:assignment", due_at="2026-11-14T10:00:00+08:00"))
+        known = self.store.put_task(exam(source_key="order:exam", start_at="2026-11-14T09:00:00+08:00",
+                                        due_at="2026-11-14T11:30:00+08:00"))
+        missing = self.store.put_task(exam(source_key="order:missing", start_at=None,
+                                          due_at="2026-11-14T08:00:00+08:00"))
+        ids = {item["id"] for item in (assignment, known, missing)}
+        ordered = [item for item in self.store.tasks() if item["id"] in ids]
+        self.assertEqual([item["id"] for item in ordered], [known["id"], assignment["id"], missing["id"]])
+        self.assertEqual(self.store.get_task(known["id"])["due_at"], "2026-11-14T11:30:00+08:00")
+
+    def test_zero_duration_exam_still_anchors_alarms_to_confirmed_start(self):
+        item = self.store.put_task(exam(start_at="2026-11-14T09:00:00+08:00", due_at="2026-11-14T09:00:00+08:00"))
+        text = to_ics([item])
+        self.assertIn("DTSTART:20261114T010000Z", text)
+        self.assertIn("DTEND:20261114T011500Z", text)
+
     def test_lecture_reminders_use_the_supplied_class_time_in_beijing(self):
         lecture = {"title": "Lecture 3（上课）", "course": "拔尖课程", "source": "manual", "kind": "lecture",
                    "due_at": "2026-10-31T20:00:00+08:00", "source_key": "lecture:ba-jian:3:2026-10-31"}

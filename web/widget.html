@@ -14,7 +14,7 @@
     <header>
       <p class="eyebrow">课期 · 主屏幕</p>
       <h1>下一次截止，抬眼就能看见。</h1>
-      <p>通过 Scriptable，在 iPhone 和 iPad 上显示作业名称、截止时间和剩余天数。数据来自设备已同步的“作业与考试”日历。</p>
+      <p>通过 Scriptable，在 iPhone 和 iPad 上显示作业截止、考试开考时间和倒计时。数据来自设备已同步的“作业与考试”日历。</p>
       <p><strong>24 小时内待交变橙色，2 小时内变红色并提示“尽快提交”。</strong>考试显示“待考”，线下作业显示“线下待交”。</p>
     </header>
     <section class="urgency-preview" aria-label="紧急作业外观示意">
@@ -36,7 +36,7 @@
       </article>
       <article>
         <span class="step-number" aria-hidden="true">2</span>
-        <div><h2>复制脚本，运行一次</h2><p>首次安装：在 Scriptable 中新建“课期”，粘贴完整代码并运行、授权日历。已经安装旧版：打开原“课期”脚本，用下方完整代码替换后运行一次；原主屏幕组件可继续使用。手机上的旧脚本不会因 Mac 程序更新而自动升级。</p><p><strong>修复日历改时后报错：</strong>新版可识别 9:00–11:30 这样的考试区间，一条异常记录也不会再让整个组件停止显示。请替换原脚本后运行一次；仅重新运行旧脚本不能修复。</p><div class="actions"><button class="button primary" id="copyScript" type="button" disabled>正在载入脚本…</button><a class="button secondary" href="/widgets/keqi-widget.js" download="课期.js">下载脚本文件</a></div><p class="status" id="copyStatus" role="status" aria-live="polite"></p><details id="sourceDetails"><summary>查看脚本内容</summary><textarea id="scriptSource" readonly spellcheck="false" aria-label="课期 Scriptable 脚本"></textarea></details></div>
+        <div><h2>复制脚本，运行一次</h2><p>首次安装：在 Scriptable 中新建“课期”，粘贴完整代码并运行、授权日历。已经安装旧版：打开原“课期”脚本，用下方完整代码替换后运行一次；原主屏幕组件可继续使用。手机上的旧脚本不会因 Mac 程序更新而自动升级。</p><p><strong>修复日历改时后报错：</strong>新版按考试开考时间计算倒计时，9:00–11:30 的考试会从 9:00 计算。请替换原脚本后运行一次；仅重新运行旧脚本不能修复。</p><div class="actions"><button class="button primary" id="copyScript" type="button" disabled>正在载入脚本…</button><a class="button secondary" href="/widgets/keqi-widget.js" download="课期.js">下载脚本文件</a></div><p class="status" id="copyStatus" role="status" aria-live="polite"></p><details id="sourceDetails"><summary>查看脚本内容</summary><textarea id="scriptSource" readonly spellcheck="false" aria-label="课期 Scriptable 脚本"></textarea></details></div>
       </article>
       <article>
         <span class="step-number" aria-hidden="true">3</span>
@@ -48,11 +48,11 @@
       <ul>
         <li>手机读取本地日历，不必与 Mac 连接同一 Wi-Fi。Mac 仍负责每天读取平台。</li>
         <li>所有日期和时间按北京时间显示。未来安排优先，过去 30 天的逾期记录另行提示；查询未来 60 天。</li>
-        <li>考试的日历区间与备注里的开考、截止时间一致时可直接展示。其他改时冲突会标注“时间待核对”，仍以备注为准；单条坏记录会提示“N 项异常”，其他安排继续显示。修改手机日历不会回传到 Mac，请在课期中修改记录后同步。</li>
+        <li>考试倒计时和紧急颜色按备注里的开考时间计算，同时显示结束时间。其他改时冲突会标注“时间待核对”，仍以备注为准；单条坏记录会提示“N 项异常”，其他安排继续显示。修改手机日历不会回传到 Mac，请在课期中修改记录后同步。</li>
         <li>“平台同步”来自 Mac 成功读取全部所选课程后写入的真实时间；“日历读取”是本次手机读取日历的时间，均按北京时间显示。打开小组件不会把平台同步时间刷新成现在。尚未完整成功但有读取记录时，会显示“平台尝试”及“部分／未完成”状态。</li>
         <li>没有同步时间、混有缺少时间的旧记录或没有任务时，会显示“平台同步时间未知”，不会用当前时间代替。小组件刷新仍由系统安排。</li>
         <li>颜色和待交计数以设备已同步的日历为准，不直接查询平台。提交后需等 Mac 核对、iCloud 更新，再等组件刷新。</li>
-        <li>提前 48／24／2 小时的提醒继续由 Apple 日历负责。脚本不会修改日历、创建通知或向 Mac 回传操作。</li>
+        <li>考试开考前、作业截止前、上课前 48／24／2 小时的提醒由 Apple 日历负责。脚本不会修改日历、创建通知或向 Mac 回传操作。</li>
         <li>当前继续使用 Apple 日历的 48／24／2 小时通知，无需安装额外闹钟 App。</li>
         <li>当前已完成脚本和模拟验证，iPhone／iPad 上的真实显示及日历权限仍需安装后确认。</li>
       </ul>

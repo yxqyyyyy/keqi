@@ -42,6 +42,25 @@ def _parse_datetime(value: str) -> datetime:
     return _local_datetime(parsed)
 
 
+def task_anchor(task: Mapping) -> datetime | None:
+    """Return the instant reminders and ordering use, without guessing dates.
+
+    Exams are due to be attended at ``start_at``. Their closing/deadline time
+    remains separate metadata and must never stand in for a missing start.
+    Assignments and lectures keep their stored deadline/class-time anchor.
+    """
+    if not isinstance(task, Mapping):
+        return None
+    try:
+        due = _parse_datetime(task.get("due_at"))
+        if task.get("kind") != "exam":
+            return due
+        start = _parse_datetime(task.get("start_at"))
+        return start if start <= due else None
+    except (ValueError, OverflowError):
+        return None
+
+
 def daily_due(now: datetime, timeHHMM: str, last_success_iso: str | None) -> bool:
     """Whether today's full collection is due in Beijing time.
 
@@ -68,8 +87,10 @@ def reminder_recheck_keys(
     48-hour, 24-hour or 2-hour reminder through the reminder instant, inclusive. Once
     the reminder instant has passed no delayed pre-reminder check is requested.
 
-    Keys contain task identity, the stored deadline, and reminder lead hours,
-    so changing a deadline permits a new check. The caller persists successful
+    Keys contain task identity, its reminder anchor, and reminder lead hours.
+    Exam anchors include an explicit policy prefix so old deadline checks never
+    suppress start-time checks, even when start and end happen to be equal.
+    Changing an exam start permits a new check. The caller persists successful
     keys in ``checked_set``; this function never mutates it. Invalid task dates
     are skipped so one malformed record cannot stop checks for other tasks.
     The 2-hour reminder also gets a final check in the last three minutes,
@@ -83,16 +104,19 @@ def reminder_recheck_keys(
             continue
         if task.get("status") != "pending" or task.get("source") not in PLATFORM_SOURCES:
             continue
-        task_id, due_iso = task.get("id"), task.get("due_at")
-        if not isinstance(task_id, str) or not task_id or not isinstance(due_iso, str):
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not task_id:
             continue
-        try:
-            due = _parse_datetime(due_iso)
-        except (ValueError, OverflowError):
+        anchor = task_anchor(task)
+        if anchor is None:
             continue
+        # Preserve existing assignment keys while migrating every exam away
+        # from the old end-time policy. Server callers use only the first | part.
+        anchor_key = ("exam-start:" + anchor.isoformat(timespec="seconds")
+                      if task.get("kind") == "exam" else task["due_at"])
         for hours in REMINDER_HOURS:
-            reminder_at = due - timedelta(hours=hours)
-            key = f"{task_id}|{due_iso}|{hours}"
+            reminder_at = anchor - timedelta(hours=hours)
+            key = f"{task_id}|{anchor_key}|{hours}"
             if reminder_at - RECHECK_WINDOW <= local_now <= reminder_at and key not in checked_set:
                 result.add(key)
             if hours == 2:

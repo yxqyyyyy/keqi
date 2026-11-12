@@ -29,7 +29,6 @@ private struct TaskInput: Decodable {
     let title: String
     let course: String?
     let due_at: String
-    let source: String?
     let kind: String?
     let start_at: String?
     let status: String?
@@ -41,13 +40,14 @@ private struct TaskInput: Decodable {
 private struct PreparedTask {
     let id: String
     let title: String
-    let due: Date
     let eventStart: Date
     let eventEnd: Date
+    let reminderAnchor: Date?
     let offsets: [TimeInterval]
     let notes: String
     let marker: URL
     let pending: Bool
+    let warning: String?
 }
 
 private struct SyncOutput: Encodable {
@@ -59,6 +59,7 @@ private struct SyncOutput: Encodable {
     let updated: Int
     let removed: Int
     let event_identifiers: [String: String]
+    let warnings: [String]
 }
 
 private struct BridgeError: LocalizedError {
@@ -153,15 +154,20 @@ private func prepare(_ input: SyncInput) throws -> [PreparedTask] {
             if task.kind == "exam" { examStart = date }
             if !lecture { lines.append("考试开始：\(displayDate(date))") }
         }
-        // A personally entered exam has a known sitting time. Platform exams
-        // can expose a broad availability window, so keep their deadline anchor.
-        let timedExam = task.source == "manual" && task.kind == "exam" &&
-            examStart.map { $0 < due } == true
-        let eventStart = timedExam ? examStart! : due
-        let eventEnd = timedExam ? due : due.addingTimeInterval(900)
-        // EventKit offsets are relative to eventStart. Keep alerts at exactly
-        // deadline - 48h/24h/2h even when the visible event starts earlier.
-        let offsets = reminderOffsets.map { due.timeIntervalSince(eventStart) + $0 }
+        let exam = task.kind == "exam"
+        if let start = examStart, start > due {
+            throw fail("考试开始时间不能晚于结束时间：\(task.id)。未执行同步。")
+        }
+        // All exams, including platform exams, are reminded before their
+        // recorded start. A missing start must never fall back to the end.
+        let reminderAnchor = exam ? examStart : due
+        let eligible = status == "pending" && reminderAnchor != nil
+        // Ineligible tasks retain a search anchor only so old owned events
+        // can be removed. They never create or retain a calendar event.
+        let eventStart = reminderAnchor ?? due
+        let eventEnd = exam && due > eventStart ? due : eventStart.addingTimeInterval(900)
+        let offsets = eligible ? reminderOffsets : []
+        if exam { lines.append("提醒基准：考试开始") }
         if let course = task.course, !course.isEmpty { lines.append("课程：\(course)") }
         if let kind = task.kind, !kind.isEmpty { lines.append("类型：\(kind)") }
         if let synced = input.platform_synced_at, !synced.isEmpty {
@@ -180,10 +186,13 @@ private func prepare(_ input: SyncInput) throws -> [PreparedTask] {
         if let notes = task.notes, !notes.isEmpty { lines.append("\n\(notes)") }
         if let updated = task.updated_at, !updated.isEmpty { lines.append("\n本地记录更新时间：\(updated)") }
         let title = task.course.flatMap { $0.isEmpty ? nil : "\($0) · \(task.title)" } ?? task.title
-        return PreparedTask(id: task.id, title: title, due: due,
-                            eventStart: eventStart, eventEnd: eventEnd, offsets: offsets,
+        let warning = status == "pending" && exam && examStart == nil ?
+            "“\(title)”缺少开考时间，未设置日历提醒；请补充开始时间。" : nil
+        return PreparedTask(id: task.id, title: title,
+                            eventStart: eventStart, eventEnd: eventEnd,
+                            reminderAnchor: reminderAnchor, offsets: offsets,
                             notes: lines.joined(separator: "\n"),
-                            marker: try markerURL(for: task.id), pending: status == "pending")
+                            marker: try markerURL(for: task.id), pending: eligible, warning: warning)
     }
 }
 
@@ -325,9 +334,13 @@ private func synchronize(_ input: SyncInput, tasks: [PreparedTask], store: EKEve
     for (taskID, event) in kept {
         if let identifier = event.eventIdentifier { eventIdentifiers[taskID] = identifier }
     }
-    return SyncOutput(ok: true, message: "已同步到 iCloud 日历“\(managedCalendarName)”。",
+    let warnings = tasks.compactMap(\.warning)
+    let message = "已同步到 iCloud 日历“\(managedCalendarName)”。" +
+        (warnings.isEmpty ? "" : "\(warnings.count) 项考试缺少开考时间，未设置提醒，请补充开始时间。")
+    return SyncOutput(ok: true, message: message,
                       calendar_identifier: calendar.calendarIdentifier, calendar_name: managedCalendarName,
-                      inserted: inserted, updated: updated, removed: removed, event_identifiers: eventIdentifiers)
+                      inserted: inserted, updated: updated, removed: removed,
+                      event_identifiers: eventIdentifiers, warnings: warnings)
 }
 
 @MainActor
@@ -407,11 +420,16 @@ private struct CalendarBridge {
                 let preview: [[String: Any]] = tasks.map { task in
                     ["id": task.id, "event_start": formatter.string(from: task.eventStart),
                      "event_end": formatter.string(from: task.eventEnd),
+                     "reminder_anchor": task.reminderAnchor.map { formatter.string(from: $0) } as Any? ?? NSNull(),
+                     "reminder_eligible": task.pending,
+                     "pending": task.pending,
+                     "warning": task.warning as Any? ?? NSNull(),
                      "reminder_offsets": task.offsets,
                      "reminder_at": task.offsets.map { formatter.string(from: task.eventStart.addingTimeInterval($0)) },
                      "notes": task.notes]
                 }
-                let result = try JSONSerialization.data(withJSONObject: ["ok": true, "tasks": preview], options: [.sortedKeys])
+                let result = try JSONSerialization.data(withJSONObject: ["ok": true, "tasks": preview,
+                    "warnings": tasks.compactMap(\.warning)], options: [.sortedKeys])
                 FileHandle.standardOutput.write(result)
                 FileHandle.standardOutput.write(Data([10]))
                 return
@@ -425,7 +443,7 @@ private struct CalendarBridge {
             status = 1
             output = SyncOutput(ok: false, message: error.localizedDescription,
                                 calendar_identifier: nil, calendar_name: managedCalendarName,
-                                inserted: 0, updated: 0, removed: 0, event_identifiers: [:])
+                                inserted: 0, updated: 0, removed: 0, event_identifiers: [:], warnings: [])
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
