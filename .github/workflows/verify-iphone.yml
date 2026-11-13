@@ -38,6 +38,8 @@ jobs:
       - name: Verify private mobile sync
         working-directory: mobile-cloud
         run: |
+          mkdir -p .openai
+          cp hosting.example.json .openai/hosting.json
           npm ci --no-audit --no-fund
           node --test tests/*.test.mjs
           npx tsc --noEmit
