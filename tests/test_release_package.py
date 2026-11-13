@@ -171,6 +171,83 @@ class ReleasePackageTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "符号链接"):
             release.collect_sources(self.root)
 
+    def test_mobile_cloud_uses_exact_files_without_traversing_runtime_or_identity(self):
+        allowed = [
+            "mobile-cloud/README.md", "mobile-cloud/package.json", "mobile-cloud/package-lock.json",
+            "mobile-cloud/vite.config.ts", "mobile-cloud/app/page.tsx", "mobile-cloud/app/mobile-client.tsx",
+            "mobile-cloud/app/api/bridge/sync/route.ts", "mobile-cloud/lib/keqi-model.ts",
+            "mobile-cloud/db/schema.ts", "mobile-cloud/drizzle/0000_short_chameleon.sql",
+            "mobile-cloud/drizzle/meta/_journal.json", "mobile-cloud/worker/index.ts",
+            "mobile-cloud/public/favicon.svg", "mobile-cloud/tests/keqi-sync.test.mjs",
+            "mobile-cloud/scripts/connector-preview/connector-preview-session.mjs",
+            "mobile-cloud/scripts/vite/sites-vite-plugin.LICENSE",
+            "mobile-cloud/vendor/shadcn-tailwind-4.13.0.LICENSE.md", "mobile-cloud/.gitignore", "mobile-cloud/.npmrc",
+        ]
+        excluded = [
+            "mobile-cloud/.openai/hosting.json", "mobile-cloud/.git/config",
+            "mobile-cloud/.sites-runtime/publish.json", "mobile-cloud/.wrangler/state/local.sqlite",
+            "mobile-cloud/node_modules/private/package.json", "mobile-cloud/dist/server/index.js",
+            "mobile-cloud/.env", "mobile-cloud/.env.production", "mobile-cloud/.dev.vars",
+            "mobile-cloud/.dev.vars.local", "mobile-cloud/tsconfig.tsbuildinfo",
+            "mobile-cloud/package-backup.json", "mobile-cloud/public/private.json",
+            "mobile-cloud/lib/credentials.ts", "mobile-cloud/scripts/unknown.mjs",
+            "mobile-cloud/app/data/private.ts", "mobile-cloud/vendor/private.css",
+        ]
+        for name in allowed:
+            self.write(name, "source fixture\n")
+        for name in excluded:
+            self.write(name, "must never be read\n")
+        self.write("mobile-cloud/hosting.example.json", '{"d1":"DB","r2":null}\n')
+        original_iterdir = Path.iterdir
+
+        def checked_iterdir(path):
+            self.assertNotIn("mobile-cloud", path.relative_to(self.root).parts)
+            return original_iterdir(path)
+
+        with patch.object(Path, "iterdir", checked_iterdir):
+            sources = release.collect_sources(self.root)
+        self.assertTrue(set(allowed).issubset(sources))
+        self.assertIn("mobile-cloud/hosting.example.json", sources)
+        self.assertTrue(set(excluded).isdisjoint(sources))
+        output = self.root / "dist" / "keqi-source.zip"
+        release.build_archive(self.root, output, sources)
+        release.audit_archive(output, sources)
+
+    def test_mobile_cloud_manifest_example_rejects_deployment_identity(self):
+        identity = "private-project-identity"
+        self.write("mobile-cloud/hosting.example.json", '{"d1":"DB","r2":null,"project_id":"' + identity + '"}')
+        with self.assertRaises(release.ReleaseError) as raised:
+            release.collect_sources(self.root)
+        self.assertNotIn(identity, str(raised.exception))
+        self.assertIn("D1/R2", str(raised.exception))
+
+    def test_mobile_cloud_manifest_example_rejects_invalid_json(self):
+        self.write("mobile-cloud/hosting.example.json", "invalid")
+        with self.assertRaisesRegex(release.ReleaseError, "有效 JSON"):
+            release.collect_sources(self.root)
+
+    def test_mobile_cloud_source_root_symlink_is_rejected(self):
+        target = self.root / "private-source"
+        target.mkdir()
+        (self.root / "mobile-cloud").symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(release.ReleaseError, "符号链接"):
+            release.collect_sources(self.root)
+
+    def test_mobile_cloud_nested_source_symlink_is_rejected(self):
+        target = self.root / "private-source"
+        target.mkdir()
+        (self.root / "mobile-cloud" / "scripts").mkdir(parents=True)
+        (self.root / "mobile-cloud" / "scripts" / "vite").symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(release.ReleaseError, "符号链接"):
+            release.collect_sources(self.root)
+
+    def test_mobile_cloud_named_source_symlink_cannot_read_private_target(self):
+        private = self.write("data/private.txt", "must not read")
+        (self.root / "mobile-cloud").mkdir()
+        (self.root / "mobile-cloud" / "README.md").symlink_to(private)
+        with self.assertRaisesRegex(release.ReleaseError, "链接"):
+            release.collect_sources(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

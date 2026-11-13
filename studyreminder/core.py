@@ -25,6 +25,13 @@ LEGACY_COURSE_SCOPE = {"chaoxing_homework": ["概率论"], "chaoxing_exams": ["�
                        "xiji": ["计算机组成", "离散数学"]}
 SOURCES = {"chaoxing", "xiji", "manual", "physics"}
 KINDS = {"assignment", "exam", "lecture"}
+EDITABLE_TASK_FIELDS = {"title", "course", "kind", "start_at", "due_at", "status", "url", "notes"}
+
+
+class TaskConflictError(ValueError):
+    def __init__(self, current_task):
+        super().__init__("任务已在另一台设备修改，请查看最新内容后重试")
+        self.current_task = copy.deepcopy(current_task)
 
 
 def now_iso():
@@ -60,9 +67,10 @@ def validate_task(raw, existing=None):
     item.setdefault("source", "manual")
     item.setdefault("kind", "assignment")
     item.setdefault("status", "pending")
-    if item["source"] not in SOURCES or item["kind"] not in KINDS:
+    if (not isinstance(item["source"], str) or item["source"] not in SOURCES
+            or not isinstance(item["kind"], str) or item["kind"] not in KINDS):
         raise ValueError("任务来源或类型不正确")
-    if item["status"] not in {"pending", "completed"}:
+    if not isinstance(item["status"], str) or item["status"] not in {"pending", "completed"}:
         raise ValueError("任务状态不正确")
     item["due_at"] = parse_datetime(item.get("due_at")).isoformat(timespec="seconds")
     item["start_at"] = parse_datetime(item["start_at"]).isoformat(timespec="seconds") if item.get("start_at") else None
@@ -122,6 +130,19 @@ def _preserved_notes(*values):
     return result if len(result) <= 6000 else None
 
 
+def _apply_task_overrides(incoming, existing, overrides):
+    item = {**incoming, **overrides}
+    start = item.get("start_at")
+    if start and (parse_datetime(start) > parse_datetime(item["due_at"])
+                  or item["kind"] == "lecture" and start != item["due_at"]):
+        # The source and a personal time edit can each be valid while their
+        # combination is invalid. Retain the last valid time combination.
+        for field in ("kind", "start_at", "due_at"):
+            if field not in overrides:
+                item[field] = existing.get(field)
+    return validate_task(item, existing)
+
+
 def physics_occurrences(settings, now=None, weeks=8):
     cfg = settings["physics"]
     if not cfg["enabled"]:
@@ -162,6 +183,13 @@ class Store:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, dedup TEXT UNIQUE, body TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, body TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS task_state (
+                    id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
+                    overrides TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO task_state (id, revision, overrides, deleted)
+                    SELECT id, 1, '{}', 0 FROM tasks;
+                CREATE TABLE IF NOT EXISTS cloud_receipts (op_id TEXT PRIMARY KEY, body TEXT NOT NULL);
             """)
             row = db.execute("SELECT body FROM kv WHERE key='settings'").fetchone()
             saved = json.loads(row[0]) if row else {}
@@ -212,10 +240,23 @@ class Store:
                 current[key].update(saved.get(key, {}))
                 current[key].update(patch.get(key, {}))
             if reset_future_physics:
+                occurrences = {item["id"]: item for item in physics_occurrences(current)}
                 for task_id, body in db.execute("SELECT id, body FROM tasks WHERE id LIKE 'physics-%'").fetchall():
                     old = json.loads(body)
                     if old["status"] == "pending" and parse_datetime(old["due_at"]) >= datetime.now(TZ):
-                        db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+                        previous, dedup, overrides = self._task_record(db, task_id)
+                        if task_id in occurrences:
+                            item = _apply_task_overrides(occurrences[task_id], previous, overrides)
+                            self._write_task(db, item, dedup, previous, overrides)
+                        else:
+                            if {"kind", "start_at", "due_at"}.intersection(overrides):
+                                # Retain companion time fields while the weekly
+                                # item is disabled, so its edited schedule can
+                                # be restored as a valid whole later.
+                                overrides = {**{field: previous.get(field) for field in ("kind", "start_at", "due_at")},
+                                             **overrides}
+                                self._write_task(db, previous, dedup, previous, overrides)
+                            db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
             db.execute("INSERT INTO kv VALUES ('settings', ?) ON CONFLICT(key) DO UPDATE SET body=excluded.body",
                        (json.dumps(current, ensure_ascii=False),))
         return current
@@ -279,45 +320,193 @@ class Store:
 
     def ensure_physics(self):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             for item in physics_occurrences(self.settings()):
-                db.execute("INSERT OR IGNORE INTO tasks VALUES (?, ?, ?)",
-                           (item["id"], item["id"], json.dumps(item, ensure_ascii=False)))
+                if db.execute("SELECT id FROM tasks WHERE id=?", (item["id"],)).fetchone():
+                    continue
+                self._write_task(db, item, item["id"])
 
-    def tasks(self):
+    def _task_record(self, db, task_id):
+        row = db.execute("SELECT dedup, body FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise KeyError("任务不存在")
+        state = db.execute("SELECT revision, overrides, deleted FROM task_state WHERE id=?", (task_id,)).fetchone()
+        item = json.loads(row[1])
+        item["revision"] = state[0] if state else 1
+        item["deleted"] = bool(state[2]) if state else False
+        return item, row[0], json.loads(state[1]) if state else {}
+
+    def _write_task(self, db, item, dedup, existing=None, overrides=None, deleted=False):
+        """Persist task content and its edit policy in the caller's transaction."""
+        state = db.execute("SELECT revision, overrides, deleted FROM task_state WHERE id=?", (item["id"],)).fetchone()
+        if existing is None and state:
+            # A weekly configuration change can temporarily remove a future
+            # occurrence. Its revision and personal edits survive recreation.
+            overrides = json.loads(state[1])
+            item = validate_task({**item, **overrides}, item)
+            deleted = bool(state[2])
+        overrides = overrides or {}
+        body = {key: value for key, value in item.items() if key not in {"revision", "deleted"}}
+        if deleted:
+            body["status"] = "completed"
+        revision = state[0] + 1 if existing is None and state else 1
+        if existing is not None:
+            previous, _, previous_overrides = self._task_record(db, existing["id"])
+            previous_body = {key: value for key, value in previous.items()
+                             if key not in {"revision", "deleted", "updated_at"}}
+            content = {key: value for key, value in body.items() if key != "updated_at"}
+            changed = (content != previous_body or overrides != previous_overrides
+                       or deleted != previous["deleted"])
+            revision = previous["revision"] + int(changed)
+            body["updated_at"] = now_iso() if changed else previous["updated_at"]
+        db.execute("INSERT INTO tasks VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET dedup=excluded.dedup, body=excluded.body",
+                   (body["id"], dedup, json.dumps(body, ensure_ascii=False)))
+        db.execute("INSERT INTO task_state VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision, overrides=excluded.overrides, deleted=excluded.deleted",
+                   (body["id"], revision, json.dumps(overrides, ensure_ascii=False), int(deleted)))
+        return {**body, "revision": revision, "deleted": deleted}
+
+    def tasks(self, include_deleted=False):
         self.ensure_physics()
         with self.connect() as db:
-            result = [json.loads(row[0]) for row in db.execute("SELECT body FROM tasks")]
+            result = [self._task_record(db, row[0])[0] for row in db.execute("SELECT id FROM tasks").fetchall()]
+        if not include_deleted:
+            result = [item for item in result if not item["deleted"]]
         return sorted(result, key=lambda t: (task_anchor(t) or datetime.max.replace(tzinfo=TZ), t["id"]))
 
     def get_task(self, task_id):
         with self.connect() as db:
-            row = db.execute("SELECT body FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if not row:
-            raise KeyError("任务不存在")
-        return json.loads(row[0])
+            return self._task_record(db, task_id)[0]
 
-    def put_task(self, raw, task_id=None):
-        item = validate_task(raw, self.get_task(task_id) if task_id else None)
+    def _put_task(self, db, raw, task_id=None, mark_overrides=True, override_fields=None):
+        existing, dedup, overrides = self._task_record(db, task_id) if task_id else (None, None, {})
+        if existing and existing["deleted"]:
+            raise TaskConflictError(existing)
+        item = validate_task(raw, existing)
         if item["source"] == "physics" and not task_id:
             raise ValueError("请在每周大物设置中创建重复任务；临时安排可选择手动添加")
+        if existing and mark_overrides and existing["source"] in {"chaoxing", "xiji", "physics"}:
+            overrides.update({key: item[key] for key in EDITABLE_TASK_FIELDS.intersection(raw)
+                              if item.get(key) != existing.get(key) or key in (override_fields or ())})
+        # Keep the collected identity when display fields are edited, including
+        # old records whose source identity was derived from their original text.
+        if not existing or any(item.get(key) != existing.get(key) for key in ("source", "source_key")):
+            dedup = item["id"] if item["source"] == "physics" else stable_key(item)
+        return self._write_task(db, item, dedup, existing, overrides)
+
+    def put_task(self, raw, task_id=None, *, mark_overrides=True, expected_revision=None):
         with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             try:
-                db.execute("INSERT INTO tasks VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET dedup=excluded.dedup, body=excluded.body",
-                           (item["id"], item["id"] if item["source"] == "physics" else stable_key(item), json.dumps(item, ensure_ascii=False)))
+                if expected_revision is not None:
+                    if type(expected_revision) is not int or expected_revision < 1 or not task_id:
+                        raise ValueError("任务版本不正确")
+                    current = self._task_record(db, task_id)[0]
+                    if current["revision"] != expected_revision:
+                        raise TaskConflictError(current)
+                return self._put_task(db, raw, task_id, mark_overrides)
             except sqlite3.IntegrityError as exc:
                 raise ValueError("同一任务已经存在，请编辑已有任务") from exc
-        return item
 
-    def delete_task(self, task_id):
-        item = self.get_task(task_id)
+    def apply_task_patch(self, task_id, changes, expected_revision=None, base_fields=None):
         with self.connect() as db:
-            if item["source"] == "physics":
-                # Tombstone prevents weekly materialization from resurrecting a deleted week.
-                item["status"] = "completed"
-                item["updated_at"] = now_iso()
-                db.execute("UPDATE tasks SET body=? WHERE id=?", (json.dumps(item, ensure_ascii=False), task_id))
-            else:
-                db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+            db.execute("BEGIN IMMEDIATE")
+            return self._apply_task_patch(db, task_id, changes, expected_revision, base_fields)
+
+    def _apply_task_patch(self, db, task_id, changes, expected_revision=None, base_fields=None):
+        if not isinstance(changes, dict) or set(changes) - EDITABLE_TASK_FIELDS:
+            raise ValueError("任务修改字段不正确")
+        if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 1):
+            raise ValueError("任务版本不正确")
+        if base_fields is not None and (not isinstance(base_fields, dict) or set(changes) - set(base_fields)):
+            raise ValueError("请提供每个修改字段原来的值")
+        current, _, _ = self._task_record(db, task_id)
+        proposed = validate_task(changes, current)
+        if current["deleted"]:
+            raise TaskConflictError(current)
+        if base_fields is not None:
+            if any(current.get(key) not in (base_fields[key], proposed.get(key)) for key in changes):
+                raise TaskConflictError(current)
+        elif expected_revision is not None and expected_revision != current["revision"]:
+            raise TaskConflictError(current)
+        override_fields = {key for key in changes if proposed.get(key) != base_fields[key]} if base_fields is not None else None
+        return self._put_task(db, changes, task_id, override_fields=override_fields)
+
+    def delete_task(self, task_id, expected_revision=None):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self._delete_task(db, task_id, expected_revision)
+
+    def _delete_task(self, db, task_id, expected_revision=None):
+        if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 1):
+            raise ValueError("任务版本不正确")
+        item, dedup, overrides = self._task_record(db, task_id)
+        if expected_revision is not None and item["revision"] != expected_revision:
+            raise TaskConflictError(item)
+        item["status"] = "completed"
+        return self._write_task(db, item, dedup, item, overrides, deleted=True)
+
+    def apply_remote_operation(self, operation):
+        """Commit an immutable phone operation and its receipt atomically."""
+        if not isinstance(operation, dict):
+            return {"op_id": None, "status": "invalid", "message": "手机修改格式不正确"}
+        op_id = operation.get("op_id")
+        if not isinstance(op_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", op_id):
+            return {"op_id": None, "status": "invalid", "message": "修改编号不正确"}
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = db.execute("SELECT body FROM cloud_receipts WHERE op_id=?", (op_id,)).fetchone()
+            if saved:
+                return json.loads(saved[0])
+            db.execute("SAVEPOINT remote_change")
+            try:
+                task_id = operation.get("task_id")
+                if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", task_id):
+                    raise ValueError("任务编号不正确")
+                action = operation.get("action")
+                if not isinstance(action, str):
+                    raise ValueError("手机修改操作不正确")
+                if action == "create":
+                    changes = operation.get("changes")
+                    if (not isinstance(changes, dict) or set(changes) - EDITABLE_TASK_FIELDS - {"source"}
+                            or changes.get("source", "manual") != "manual" or task_id.startswith("physics-")):
+                        raise ValueError("手机新增任务只能使用手动来源")
+                    existing = db.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
+                    if existing:
+                        raise TaskConflictError(self._task_record(db, task_id)[0])
+                    item = validate_task({**changes, "source": "manual"})
+                    item["id"] = task_id
+                    current = self._write_task(db, item, stable_key(item))
+                elif action in {"patch", "delete"}:
+                    revision = operation.get("base_revision")
+                    if type(revision) is not int or revision < 1:
+                        raise ValueError("手机修改缺少任务原版本")
+                    if action == "patch":
+                        current = self._apply_task_patch(db, task_id, operation.get("changes"), revision,
+                                                         operation.get("base"))
+                    else:
+                        current = self._delete_task(db, task_id, revision)
+                else:
+                    raise ValueError("手机修改操作不正确")
+                receipt = {"op_id": op_id, "status": "applied", "message": "已保存到 Mac", "current": current}
+            except TaskConflictError as exc:
+                receipt = {"op_id": op_id, "status": "conflict", "message": str(exc), "current": exc.current_task}
+            except KeyError:
+                receipt = {"op_id": op_id, "status": "conflict", "message": "Mac 上找不到该任务", "current": None}
+            except (ValueError, sqlite3.IntegrityError) as exc:
+                message = "同一任务已经存在，请编辑已有任务" if isinstance(exc, sqlite3.IntegrityError) else str(exc)
+                receipt = {"op_id": op_id, "status": "invalid", "message": message}
+            if receipt["status"] != "applied":
+                db.execute("ROLLBACK TO remote_change")
+            db.execute("RELEASE remote_change")
+            db.execute("INSERT INTO cloud_receipts VALUES (?, ?)", (op_id, json.dumps(receipt, ensure_ascii=False)))
+            return receipt
+
+    def remote_receipts(self, limit=500):
+        if type(limit) is not int or not 1 <= limit <= 10000:
+            raise ValueError("同步回执数量不正确")
+        with self.connect() as db:
+            rows = db.execute("SELECT body FROM cloud_receipts ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+        return [json.loads(row[0]) for row in reversed(rows)]
 
     def import_tasks(self, values):
         if not isinstance(values, list) or len(values) > 1000:
@@ -347,6 +536,8 @@ class Store:
                 if fingerprint:
                     canonical_keys.setdefault(fingerprint, set()).add(candidate["source_key"])
             for item in prepared:
+                migrated_overrides = {}
+                migrated_deleted = False
                 key = item["id"] if item["source"] == "physics" else stable_key(item)
                 row = db.execute("SELECT id, body FROM tasks WHERE dedup=?", (key,)).fetchone()
                 fingerprint = _canonical_chaoxing_exam_fingerprint(item)
@@ -371,18 +562,26 @@ class Store:
                                 if completed:
                                     item["status"] = "completed"
                                     if legacy["status"] != "completed":
+                                        previous, legacy_key, legacy_overrides = self._task_record(db, old[0])
                                         legacy["status"] = "completed"
-                                        legacy["updated_at"] = now_iso()
-                                        db.execute("UPDATE tasks SET body=? WHERE id=?",
-                                                   (json.dumps(legacy, ensure_ascii=False), old[0]))
+                                        self._write_task(db, legacy, legacy_key, previous, legacy_overrides,
+                                                         deleted=previous["deleted"])
                             else:
                                 # Keep the original task/calendar identity.
                                 # Remove an exact duplicate in this transaction
                                 # before moving its unique dedup key.
+                                previous, _, migrated_overrides = self._task_record(db, old[0])
+                                migrated_deleted = previous["deleted"]
                                 if row:
+                                    duplicate_task, _, duplicate_overrides = self._task_record(db, row[0])
+                                    migrated_overrides = {**duplicate_overrides, **migrated_overrides}
+                                    migrated_deleted = migrated_deleted or duplicate_task["deleted"]
                                     db.execute("DELETE FROM tasks WHERE id=?", (row[0],))
+                                    db.execute("DELETE FROM task_state WHERE id=?", (row[0],))
                                 db.execute("UPDATE tasks SET dedup=? WHERE id=?", (key, old[0]))
                                 legacy["notes"] = notes
+                                if "notes" in migrated_overrides:
+                                    migrated_overrides["notes"] = notes
                                 if completed:
                                     legacy["status"] = "completed"
                                 if not legacy.get("calendar_id") and duplicate:
@@ -390,8 +589,16 @@ class Store:
                                 row = (old[0], json.dumps(legacy, ensure_ascii=False))
                 if row:
                     existing = json.loads(row[1])
+                    previous, _, overrides = self._task_record(db, row[0])
+                    overrides.update(migrated_overrides)
+                    if previous["deleted"] or migrated_deleted:
+                        # The source may keep advertising an item after it was
+                        # deleted locally. Retain its identity as a tombstone.
+                        result.append(self._write_task(db, previous, key, previous, overrides, deleted=True))
+                        continue
                     # A stale import must not undo a user's completed state.
                     item["id"] = row[0]
+                    source_completed = item["status"] == "completed"
                     if existing["status"] == "completed":
                         item["status"] = "completed"
                     if fingerprint:
@@ -400,10 +607,15 @@ class Store:
                         item["notes"] = _preserved_notes(existing.get("notes", ""), item["notes"])
                         if item["notes"] is None:
                             item["notes"] = existing.get("notes", "")
-                        item["calendar_id"] = existing.get("calendar_id")
-                db.execute("INSERT INTO tasks VALUES (?, ?, ?) ON CONFLICT(dedup) DO UPDATE SET body=excluded.body",
-                           (item["id"], key, json.dumps(item, ensure_ascii=False)))
-                result.append(item)
+                    item["calendar_id"] = existing.get("calendar_id")
+                    item = _apply_task_overrides(item, previous, overrides)
+                    # A positive submission result always cancels reminders,
+                    # including after a user previously reopened the task.
+                    if existing["status"] == "completed" or source_completed:
+                        item["status"] = "completed"
+                    result.append(self._write_task(db, item, key, previous, overrides))
+                else:
+                    result.append(self._write_task(db, item, key))
         return result
 
 

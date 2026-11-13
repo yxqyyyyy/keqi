@@ -70,6 +70,33 @@ class SecurityTests(unittest.TestCase):
         h.do_GET()
         self.assertEqual(h.responses[0][0][0], 200)
 
+    def test_cloud_credentials_are_never_exposed_in_public_state(self):
+        self.app.cloud.configure({"url": "https://example.test", "bridge_key": "testing-key-" * 4,
+                                  "sites_token": "testing-sites-token"})
+        state = self.app.state()
+        self.assertTrue(state["cloud_sync"]["configured"])
+        self.assertNotIn("testing-key-", json.dumps(state))
+        self.assertNotIn("testing-sites-token", json.dumps(state))
+
+    def test_paired_phone_cannot_replace_mac_cloud_credentials(self):
+        h = self.handler(peer="192.168.1.40", host="192.168.1.20:8765", cookie="study_pair=" + self.app.token,
+                         path="/api/cloud/config")
+        h.command = "PUT"
+        h.mutate()
+        self.assertEqual(h.responses[0][0][0], 403)
+
+    def test_stale_mac_form_does_not_overwrite_phone_changes(self):
+        task = self.app.store.put_task({"title": "旧标题", "due_at": "2027-01-01T00:00:00+08:00"})
+        self.app.store.put_task({"title": "手机更新标题"}, task["id"])
+        h = self.handler(path="/api/tasks/" + task["id"])
+        h.command = "PUT"
+        body = json.dumps({"title": "Mac过期表单", "expected_revision": task["revision"]}).encode()
+        h.rfile = io.BytesIO(body)
+        h.headers.replace_header("Content-Length", str(len(body)))
+        h.mutate()
+        self.assertEqual(h.responses[0][0][0], 409)
+        self.assertEqual(self.app.store.get_task(task["id"])["title"], "手机更新标题")
+
 
 if __name__ == "__main__":
     unittest.main()

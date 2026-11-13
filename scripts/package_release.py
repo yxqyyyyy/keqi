@@ -52,6 +52,28 @@ IOS_SOURCE_DIRECTORIES = frozenset({
     "ios/KeqiAlarm", "ios/AlarmCore/Sources/KeqiAlarmCore",
     "ios/AlarmCore/Sources/AlarmCoreChecks", "ios/AlarmCore/Tests/KeqiAlarmCoreTests",
 })
+MOBILE_CLOUD_FILES = frozenset({
+    ".gitignore", ".npmrc", "README.md", "hosting.example.json",
+    "package.json", "package-lock.json", "tsconfig.json", "cloudflare-env.d.ts",
+    "next.config.ts", "vite.config.ts", "drizzle.config.ts", "postcss.config.mjs", "eslint.config.mjs",
+    "app/chatgpt-auth.ts", "app/globals.css", "app/layout.tsx", "app/page.tsx", "app/mobile-client.tsx",
+    "app/api/mobile/route.ts", "app/api/mobile/operations/route.ts", "app/api/mobile/resolve/route.ts",
+    "app/api/bridge/sync/route.ts",
+    "lib/keqi-model.ts", "lib/keqi-sync.ts", "lib/utils.ts", "lib/connector-context.ts",
+    "lib/connector-contract.mts", "lib/connector-errors.mts", "lib/connector-preview.d.ts", "lib/connectors.ts",
+    "db/index.ts", "db/schema.ts", "drizzle/0000_short_chameleon.sql",
+    "drizzle/meta/_journal.json", "drizzle/meta/0000_snapshot.json",
+    "worker/index.ts", "public/favicon.svg", "tests/keqi-model.test.mjs", "tests/keqi-sync.test.mjs",
+    "tests/keqi-mobile-request.test.mjs",
+    "scripts/build-verified.sh", "scripts/execution-profile.mjs", "scripts/install-ci.mjs",
+    "scripts/install-ci.sh", "scripts/install-pnpm.sh", "scripts/npm-install.mjs", "scripts/pnpm-install.mjs",
+    "scripts/run-framework.mjs", "scripts/sites-env.mjs", "scripts/sites-env.sh", "scripts/tool-environment.mjs",
+    "scripts/vite/sites-vite-plugin.ts", "scripts/vite/sites-vite-plugin.LICENSE",
+    "scripts/vite/connector-preview-plugin.mjs", "scripts/connector-preview/connector-preview-session.mjs",
+    "scripts/connector-preview/protocol.mjs", "scripts/connector-preview/host-binding.mjs",
+    "scripts/connector-preview/worker.mjs",
+    "vendor/shadcn-tailwind-4.13.0.css", "vendor/shadcn-tailwind-4.13.0.LICENSE.md",
+})
 FORBIDDEN_PARTS = frozenset({
     "data", "build", "dist", "node_modules", "__pycache__", "logs", "log",
     "backup", "backups", "exports", "browser-profile", "browser-session",
@@ -105,6 +127,10 @@ def allowed_source(relative: PurePosixPath) -> bool:
         return parts[0] in ROOT_FILES
     if str(relative) == WORKFLOW_FILE:
         return True
+    if parts[0] == "mobile-cloud":
+        # Each optional cloud template file is named explicitly. In particular,
+        # the actual hosting identity and checkout-local runtime are absent.
+        return PurePosixPath(*parts[1:]).as_posix() in MOBILE_CLOUD_FILES
     if not _safe_parts(relative) or (PRIVATE_NAME.search(relative.name) and str(relative) not in SAFE_NAMED_SOURCES):
         return False
     if parts[0] == "ios":
@@ -150,6 +176,13 @@ def audit_content(relative: str, payload: bytes) -> None:
         raise ReleaseError(f"源码不是 UTF-8 文本：{relative}") from None
     if "\x00" in text:
         raise ReleaseError(f"源码包含二进制内容：{relative}")
+    if relative == "mobile-cloud/hosting.example.json":
+        try:
+            hosting = json.loads(text)
+        except ValueError:
+            raise ReleaseError("手机云端配置示例必须是有效 JSON。") from None
+        if hosting != {"d1": "DB", "r2": None}:
+            raise ReleaseError("手机云端配置示例只能包含通用 D1/R2 绑定。")
     for line_number, line in enumerate(text.splitlines(), 1):
         if PERSONAL_PATH.search(line):
             raise ReleaseError(f"包含个人绝对路径：{relative}:{line_number}")
@@ -245,6 +278,12 @@ def collect_sources(root: Path) -> dict[str, SourceFile]:
         if any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
             raise ReleaseError("iPhone 源码目录不能包含符号链接。")
         scan(path)
+    for relative in sorted(MOBILE_CLOUD_FILES):
+        path = root / "mobile-cloud" / relative
+        if any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
+            raise ReleaseError("手机云端源码目录不能包含符号链接。")
+        if path.exists() or path.is_symlink():
+            add(path)
     if not files:
         raise ReleaseError("未找到可发布的源码文件。")
     if sum(len(source.content) for source in files.values()) > MAX_TOTAL_BYTES:

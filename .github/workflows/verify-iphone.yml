@@ -14,6 +14,7 @@ on:
       - 'requirements.txt'
       - 'scripts/**'
       - 'widgets/**'
+      - 'mobile-cloud/**'
       - 'tests/**'
       - '.github/workflows/verify-iphone.yml'
   workflow_dispatch:
@@ -30,6 +31,16 @@ jobs:
     steps:
       - name: Check out audited source
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Set up JavaScript runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Verify private mobile sync
+        working-directory: mobile-cloud
+        run: |
+          npm ci --no-audit --no-fund
+          node --test tests/*.test.mjs
+          npx tsc --noEmit
       - name: Verify Swift core
         run: |
           xcrun swift test --package-path ios/AlarmCore

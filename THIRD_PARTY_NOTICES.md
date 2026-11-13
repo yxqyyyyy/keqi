@@ -34,3 +34,15 @@ SOFTWARE.
 研究中亦检查了 `Cooanyh/chaoxing-list`（AGPL-3.0-or-later）以及
 `coursegrading/CourseGrading`（公开资料仓库，未发现许可证）；当前程序没有复制
 或包含这两个仓库的代码。
+
+## 手机云端模板
+
+`mobile-cloud/` 使用 Sites 提供的 Vinext starter，保留其 Worker 入口、连接器预览和构建辅助文件。
+随模板提供的 Sites Vite 插件使用 MIT License，Copyright (c) 2026 OpenAI，
+完整许可保留在 `mobile-cloud/scripts/vite/sites-vite-plugin.LICENSE`。
+
+随模板提供的 shadcn Tailwind 样式资源使用 MIT License，Copyright (c) 2023 shadcn，
+完整许可保留在 `mobile-cloud/vendor/shadcn-tailwind-4.13.0.LICENSE.md`。
+
+手机云端的依赖和锁定版本见 `mobile-cloud/package.json` 与 `mobile-cloud/package-lock.json`。
+各依赖的许可证随对应软件分发，重新分发时应保留其适用的许可声明。

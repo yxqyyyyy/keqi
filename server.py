@@ -20,7 +20,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from studyreminder.calendar_sync import CalendarSync
 from studyreminder.collector import BrowserCollector
-from studyreminder.core import Store, TZ, now_iso, to_ics
+from studyreminder.core import Store, TaskConflictError, TZ, now_iso, to_ics
+from studyreminder.cloud_sync import CloudSync
 from studyreminder.scheduling import daily_due, reminder_recheck_keys
 from studyreminder.sync_status import platform_synced_at, sync_info, sync_signature
 
@@ -48,6 +49,7 @@ class Application:
         self.store = Store(self.data_dir / "tasks.sqlite3")
         self.store.patch_settings({"collection": {"interval_minutes": 1440}})
         self.calendar = CalendarSync(ROOT, self.store)
+        self.cloud = CloudSync(self.data_dir, self.store)
         self.collector = BrowserCollector(self.data_dir)
         self.lan, self.port, self.ip = lan, port, local_ip()
         self.token = self.store.get_value("pairing_token")
@@ -65,7 +67,7 @@ class Application:
         tasks = self.store.tasks()
         confirmed = {(t["source"], t.get("source_key")) for t in tasks if t.get("source_key")}
         pending = [t for t in self.collector.last_candidates if t["status"] != "completed" and (t["source"], t.get("source_key")) not in confirmed]
-        return {"tasks": tasks, "settings": self.store.settings(),
+        return {"tasks": tasks, "settings": self.store.settings(), "cloud_sync": self.cloud.info(),
                 "platforms": self.collector.status, "calendar_sync": self.calendar.info(),
                 "collection": {"pending_count": len(pending), "candidates": pending,
                                "completed_count": sum(t["status"] == "completed" for t in self.collector.last_candidates),
@@ -81,6 +83,20 @@ class Application:
                 "connection": {"mode": "lan" if self.lan else "local_only",
                                "url": f"http://{self.ip}:{self.port}/?token={self.token}" if self.lan else None},
                 "server_time": now_iso(), "timezone": "Asia/Shanghai"}
+
+    def background_cloud(self):
+        # Independent from slow platform requests; wake also flushes local edits.
+        while not self.stop.is_set():
+            self.cloud.wake.clear()
+            try:
+                result = self.cloud.sync()
+                if result.get("applied"):
+                    self.calendar.sync_if_enabled()
+            except Exception:
+                self.store.set_value("cloud_sync_status", {
+                    **self.store.get_value("cloud_sync_status", {}), "ok": False,
+                    "last_attempt_at": now_iso(), "message": "云同步未完成，恢复后会重试；本机任务已保留"})
+            self.cloud.wake.wait(60)
 
     def background(self):
         # Calendar alarms live in iCloud, not in this timer. This only materializes
@@ -588,10 +604,19 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/tasks/"):
                 task_id = unquote(path[len("/api/tasks/"):])
                 if self.command == "PUT":
-                    result, changed = self.app.store.put_task(raw, task_id), True
+                    revision = raw.pop("expected_revision", None)
+                    result, changed = self.app.store.put_task(raw, task_id, expected_revision=revision), True
                 elif self.command == "DELETE":
-                    self.app.store.delete_task(task_id)
+                    self.app.store.delete_task(task_id, raw.get("expected_revision"))
                     result, changed = {"ok": True}, True
+            elif self.command == "POST" and path == "/api/cloud/sync":
+                result = self.app.cloud.sync()
+                if result.get("applied"):
+                    self.app.calendar.sync_if_enabled()
+            elif self.command == "PUT" and path == "/api/cloud/config":
+                if self.client_address[0] not in {"127.0.0.1", "::1"}:
+                    raise PermissionError("云同步连接只能在 Mac 本机设置")
+                result = self.app.cloud.configure(raw)
             elif self.command == "PUT" and path == "/api/settings":
                 self.app.store.update_settings(raw)
                 result, changed = self.app.state(), True
@@ -624,8 +649,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(404, {"error": "接口不存在"})
                 return
             if changed:
+                self.app.cloud.wake.set()
                 self.app.calendar.sync_if_enabled()
             self.send(200, result)
+        except TaskConflictError as exc:
+            self.send(409, {"error": str(exc), "current": exc.current_task})
         except PermissionError as exc:
             self.send(403, {"error": str(exc)})
         except KeyError:
@@ -655,6 +683,7 @@ def main():
     server.daemon_threads = True
     server.app = app
     threading.Thread(target=app.background, daemon=True, name="weekly-calendar-maintenance").start()
+    threading.Thread(target=app.background_cloud, daemon=True, name="mobile-cloud-sync").start()
     threading.Thread(target=app.resume_sessions, daemon=True, name="resume-saved-platform-sessions").start()
     print(f"作业提醒已启动：http://127.0.0.1:{args.port}", flush=True)
     if args.lan:
@@ -662,6 +691,7 @@ def main():
     print("停止：Ctrl+C。首次日历同步需点击界面的同步按钮并允许日历访问。", flush=True)
     def stop(signum, frame):
         app.stop.set()
+        app.cloud.wake.set()
         app.collector.close()
         threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, stop)

@@ -12,6 +12,7 @@ let candidates = [];
 let importTasks = [];
 let toastTimer;
 let confirmResolver = null;
+let editingTaskRevision = null;
 let lastCollectionScan = null;
 const pendingPlatformActions = new Map();
 
@@ -301,11 +302,17 @@ function renderSettings() {
   $('#deviceAccessLink').hidden = !deviceURL;
   $('#deviceURL').value = deviceURL || '';
   $('#deviceAccessMessage').textContent = deviceURL ? '将设备与 Mac 连接到同一 Wi-Fi，在 Safari 打开下方专属链接。链接包含访问凭证，请仅分享给自己的设备。' : '当前仅限此 Mac 访问。双击“启动作业提醒.command”后，手机与平板访问链接会显示在这里。';
+  const cloud = state.cloud_sync || {};
+  $('#cloudMobileLink').hidden = !cloud.url;
+  if (cloud.url) $('#cloudMobileLink').href = cloud.url;
+  $('#cloudSyncStatus').textContent = cloud.configured ? `${cloud.enabled ? '已接入' : '已暂停'} · Mac 最近成功交换：${syncTime(cloud.last_success_at)}。${cloud.message || ''}` : '尚未接入手机云端。接入后，Mac 睡眠或关机时也能在手机保存修改。';
+  $('#syncCloudButton').hidden = !cloud.enabled;
 }
 function openTask(id = null) {
   $('#taskForm').reset();
   $('#taskError').textContent = '';
   const task = id ? state.tasks.find(item => String(item.id) === String(id)) : null;
+  editingTaskRevision = task?.revision ?? null;
   $('#taskId').value = task?.id || '';
   $('#taskDialogTitle').textContent = task ? '编辑安排' : '添加安排';
   $('#taskTitle').value = task?.title || '';
@@ -443,7 +450,7 @@ document.addEventListener('click', async event => {
     const task = state.tasks.find(item => String(item.id) === completeButton.dataset.complete);
     if (!task) return;
     completeButton.disabled = true;
-    try { await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: 'PUT', body: JSON.stringify({ status: task.status === 'completed' ? 'pending' : 'completed' }) }); await refresh({ silent: true }); toast(task.status === 'completed' ? '已恢复为待完成。' : '已完成，又做好了一件事。'); }
+    try { await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: 'PUT', body: JSON.stringify({ status: task.status === 'completed' ? 'pending' : 'completed', expected_revision: task.revision }) }); await refresh({ silent: true }); toast(task.status === 'completed' ? '已恢复为待完成。' : '已完成，又做好了一件事。'); }
     catch (error) { completeButton.disabled = false; toast(error.message); }
     return;
   }
@@ -475,6 +482,7 @@ $('#taskForm').addEventListener('submit', async event => {
       if (task.kind === 'lecture') { task.source = 'manual'; task.start_at = null; }
       if (!task.due_at) throw new Error(task.kind === 'lecture' ? '请填写上课时间。' : '请填写截止时间。');
       if (task.start_at && new Date(task.start_at) > new Date(task.due_at)) throw new Error('开始时间不能晚于截止时间。');
+      if (id) task.expected_revision = editingTaskRevision;
       await api(id ? `/api/tasks/${encodeURIComponent(id)}` : '/api/tasks', { method: id ? 'PUT' : 'POST', body: JSON.stringify(task) });
       $('#taskDialog').close();
       await refresh({ silent: true });
@@ -487,7 +495,7 @@ $('#deleteTaskButton').addEventListener('click', async event => {
   const task = state.tasks.find(item => String(item.id) === $('#taskId').value);
   if (!task || !await confirmDelete(task)) return;
   await busy(button, '正在删除…', async () => {
-    try { await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE' }); $('#taskDialog').close(); await refresh({ silent: true }); toast('安排已删除。'); }
+    try { await api(`/api/tasks/${encodeURIComponent(task.id)}`, { method: 'DELETE', body: JSON.stringify({ expected_revision: editingTaskRevision }) }); $('#taskDialog').close(); await refresh({ silent: true }); toast('安排已删除。'); }
     catch (error) { $('#taskError').textContent = error.message; }
   });
 });
@@ -495,6 +503,10 @@ $('#confirmAccept').addEventListener('click', () => finishConfirmation(true));
 $('#confirmCancel').addEventListener('click', () => finishConfirmation(false));
 $('#confirmDialog').addEventListener('cancel', event => { event.preventDefault(); finishConfirmation(false); });
 $('#syncCalendarButton').addEventListener('click', event => syncCalendar(event.currentTarget));
+$('#syncCloudButton').addEventListener('click', event => busy(event.currentTarget, '正在交换…', async () => {
+  try { const result = await api('/api/cloud/sync', { method: 'POST', body: '{}' }); await refresh({ silent: true }); toast(result.message || '手机修改已交换。'); }
+  catch (error) { toast(error.message); }
+}));
 $('#sidebarSync').addEventListener('click', event => { setView('settings'); syncCalendar(event.currentTarget); });
 $('#physicsTimeMode').addEventListener('change', () => { $('#physicsCustomLabel').hidden = $('#physicsTimeMode').value !== 'custom'; });
 $('#courseScopeForm').addEventListener('submit', async event => {
