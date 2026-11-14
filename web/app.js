@@ -14,6 +14,7 @@ let toastTimer;
 let confirmResolver = null;
 let editingTaskRevision = null;
 let lastCollectionScan = null;
+let refreshVersion = 0;
 const pendingPlatformActions = new Map();
 
 function escapeHTML(value) {
@@ -113,14 +114,17 @@ async function busy(button, text, action) {
   try { return await action(); } finally { button.disabled = false; button.textContent = original; }
 }
 async function refresh({ silent = false } = {}) {
+  const version = ++refreshVersion;
   try {
     const data = await api('/api/state');
+    if (version !== refreshVersion) return false;
     state = { tasks: [], settings: {}, platforms: {}, calendar_sync: {}, ...data };
     if (!Array.isArray(state.tasks)) state.tasks = [];
     $('#loadError').hidden = true;
     render();
     return true;
   } catch (error) {
+    if (version !== refreshVersion) return false;
     $('#loadError').textContent = `暂时无法读取安排：${error.message} 请确认 Mac 上的本地程序已启动，然后点击右上角刷新。`;
     $('#loadError').hidden = false;
     if (!silent) toast('暂时未能连接本地程序，已有日历提醒不受此页面影响。');
@@ -629,9 +633,13 @@ $('#copyDeviceURL').addEventListener('click', async () => {
   try { if (!navigator.clipboard?.writeText) throw new Error('manual'); await navigator.clipboard.writeText(input.value); toast('访问链接已复制，可发送给自己的设备。'); }
   catch { input.focus(); input.select(); toast('请复制已选中的链接，在自己的 iPhone 或 iPad 打开。'); }
 });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh({ silent: true }); });
-setInterval(() => {
-  if (!document.hidden && currentView !== 'settings' && !document.querySelector('dialog[open]') && !document.activeElement.matches('input,textarea,select')) refresh({ silent: true });
-}, 60000);
+function refreshWhenVisible() {
+  if (document.hidden || currentView === 'settings' || document.querySelector('dialog[open]')) return;
+  return refresh({ silent: true });
+}
+document.addEventListener('visibilitychange', refreshWhenVisible);
+window.addEventListener('focus', refreshWhenVisible);
+window.addEventListener('pageshow', refreshWhenVisible);
+setInterval(refreshWhenVisible, 15000);
 setView(location.hash.slice(1) || 'agenda');
 refresh({ silent: true });

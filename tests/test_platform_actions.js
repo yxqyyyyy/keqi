@@ -146,3 +146,64 @@ assert.equal(pastExam.status, 'pending');
 scenarioNow = Date.parse('2026-11-14T10:00:00+08:00');
 assert.equal(timing.isActionable(exam), true);
 console.log('Exam start countdown, overnight grouping, missing-start and agenda summary checks passed');
+
+// Phone writes must become visible even while the desktop search keeps focus.
+const refreshEvents = { document: new Map(), window: new Map() };
+let refreshCalls = 0, dialogOpen = false, refreshInterval;
+const visibleRefresh = {
+  document: {
+    hidden: false,
+    activeElement: { matches: () => true },
+    querySelector: () => dialogOpen ? {} : null,
+    addEventListener: (name, callback) => refreshEvents.document.set(name, callback),
+  },
+  window: { addEventListener: (name, callback) => refreshEvents.window.set(name, callback) },
+  currentView: 'agenda',
+  refresh: () => { refreshCalls++; },
+  setInterval: (callback, ms) => { refreshInterval = { callback, ms }; },
+};
+vm.createContext(visibleRefresh);
+vm.runInContext(section('function refreshWhenVisible()', 'setView(location.hash.slice(1)'), visibleRefresh);
+assert.equal(refreshInterval.ms, 15000);
+refreshInterval.callback();
+assert.equal(refreshCalls, 1, 'focused search must not stop phone updates');
+refreshEvents.window.get('focus')();
+refreshEvents.window.get('pageshow')();
+refreshEvents.document.get('visibilitychange')();
+assert.equal(refreshCalls, 4);
+visibleRefresh.document.hidden = true;
+refreshInterval.callback();
+assert.equal(refreshCalls, 4);
+visibleRefresh.document.hidden = false;
+dialogOpen = true;
+refreshEvents.window.get('focus')();
+assert.equal(refreshCalls, 4, 'an open edit must keep its unsaved inputs');
+dialogOpen = false;
+visibleRefresh.currentView = 'settings';
+refreshInterval.callback();
+assert.equal(refreshCalls, 4, 'automatic refresh must preserve unsaved settings');
+visibleRefresh.currentView = 'agenda';
+refreshEvents.window.get('focus')();
+assert.equal(refreshCalls, 5);
+console.log('Desktop phone-update polling and focus refresh checks passed');
+
+(async () => {
+  const requests = [];
+  let rendered = 0;
+  const latestState = {
+    state: {}, refreshVersion: 0,
+    api: () => new Promise((resolve, reject) => requests.push({ resolve, reject })),
+    $: () => ({}), render: () => { rendered++; }, toast() {},
+  };
+  vm.createContext(latestState);
+  vm.runInContext(section('async function refresh(', 'function setView('), latestState);
+  const oldRead = latestState.refresh({ silent: true });
+  const newRead = latestState.refresh({ silent: true });
+  requests[1].resolve({ tasks: [{ id: 'phone-task', status: 'completed' }] });
+  await newRead;
+  requests[0].resolve({ tasks: [{ id: 'phone-task', status: 'pending' }] });
+  await oldRead;
+  assert.equal(latestState.state.tasks[0].status, 'completed');
+  assert.equal(rendered, 1, 'an older response cannot restore stale phone state');
+  console.log('Concurrent desktop reads preserve the latest phone state');
+})().catch(error => { console.error(error); process.exitCode = 1; });
