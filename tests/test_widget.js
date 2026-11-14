@@ -241,7 +241,7 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
  r=await run({family:'small',events:[event('刚开始的课','2026-10-16T10:00:00+08:00',{kind:'lecture'})]});
  assert(r.text.includes('现在上课'));assert(!r.text.includes('现在截止'));checks++;
  r=await run({family:'small',events:[event('已开始的课','2026-10-16T09:00:00+08:00',{kind:'lecture'})]});
- assert(r.text.includes('已开始 1 小时'));assert(!r.text.includes('逾期 1 小时'));checks++;
+ assert(r.text.includes('近期没有课期待办'));assert(!/已开始的课|逾期|剩 1 小时/.test(r.text));checks++;
  const badLecture=event('时间有错的课','2026-10-16T12:00:00+08:00',{kind:'lecture'});
  badLecture.startDate=new FixedDate('2026-10-16T13:00:00+08:00');
  r=await run({events:[badLecture]});assert(r.text.includes('备注上课 10/16 12:00'));assert(r.text.includes('时间待核对'));checks++;
@@ -279,10 +279,13 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
      else if(urgent) assert(nodes(r.widget).some(node=>node.backgroundColor?.value===background));
      assert(!/尽快提交|逾期|截止/.test(r.text));checks++;
    }
-   for(const [now,label] of [['2026-11-14T09:01:00+08:00','考试中'],
-       ['2026-11-14T11:30:00+08:00','已结束']]) {
+   r=await run({family,events:[competition],now:'2026-11-14T09:01:00+08:00'});
+   assert(r.text.includes('考试中'));assert(r.text.includes('大学生数学竞赛'));
+   assert(!/24h 待考|待考 ·|逾期|剩 3 小时/.test(r.text));
+   assert.equal(r.widget.backgroundColor.value,'F7F7F0');checks++;
+   for(const now of ['2026-11-14T11:30:00+08:00','2026-11-14T11:31:00+08:00']) {
      r=await run({family,events:[competition],now});
-     assert(r.text.includes(label));assert(r.text.includes('大学生数学竞赛'));
+     assert(r.text.includes('近期没有课期待办'));assert(!r.text.includes('大学生数学竞赛'));
      assert(!/24h 待考|待考 ·|逾期|剩 3 小时/.test(r.text));
      assert.equal(r.widget.backgroundColor.value,'F7F7F0');checks++;
    }
@@ -294,6 +297,30 @@ async function run({family='medium', parameter=null, calendars=[{title:'作业�
    assert(r.text.includes('开考时间待补充'));assert(r.text.includes('11:30 结束'));
    assert(!/24h 待考|剩 |逾期|截止/.test(r.text));
    assert.equal(r.widget.backgroundColor.value,'F7F7F0');checks++;
+ }
+ // Past classes and ended exams never inflate overdue counts or the hidden-item count.
+ const pastLecture=event('历史上课记录','2026-10-16T09:00:00+08:00',{kind:'lecture'});
+ const endedExam=event('历史考试记录','2026-10-16T09:00:00+08:00',
+   {kind:'exam',start:'2026-10-16T08:00:00+08:00'});
+ const oldMissingExam=event('历史缺开考考试','2026-10-16T09:00:00+08:00',{kind:'exam'});
+ const overdueAssignment=event('应提醒的逾期作业','2026-10-16T09:00:00+08:00');
+ for(const family of ['small','medium','large','extraLarge']) {
+   r=await run({family,events:[pastLecture,endedExam,oldMissingExam]});
+   assert(r.text.includes('近期没有课期待办'));
+   assert(!/历史上课记录|历史考试记录|历史缺开考考试|逾期|待补/.test(r.text));
+   assert.equal(r.widget.backgroundColor.value,'F7F7F0');checks++;
+   r=await run({family,events:[pastLecture,endedExam,oldMissingExam,overdueAssignment]});
+   assert(r.text.includes('应提醒的逾期作业'));
+   assert(r.text.includes('逾期 1 小时'));
+   assert(!/历史上课记录|历史考试记录|历史缺开考考试|另 \d+ 项|待补/.test(r.text));
+   if(family!=='small') assert(r.text.includes('未来暂无 · 逾期 1'));
+   checks++;
+   r=await run({family,events:[pastLecture,endedExam,oldMissingExam,overdueAssignment,lecture]});
+   assert(r.text.includes('24h 上课 1'));
+   assert(r.text.includes('Lecture 3 上课'));
+   assert(!/历史上课记录|历史考试记录|历史缺开考考试|逾期 [23]|另 [23] 项/.test(r.text));
+   if(family==='small') assert(r.text.includes('逾期 1'));
+   checks++;
  }
  // Earlier start takes precedence over an assignment ending before this exam ends.
  const laterAssignment=event('十点作业','2026-11-14T10:00:00+08:00');

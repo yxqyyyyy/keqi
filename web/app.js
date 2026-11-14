@@ -41,6 +41,16 @@ function taskTime(task) {
   if (task.kind === 'exam' && (!validDate(task.due_at) || date > new Date(task.due_at))) return null;
   return date;
 }
+function isActionable(task, now = Date.now()) {
+  if (task.status === 'completed') return false;
+  if (task.kind === 'assignment') return true;
+  if (!validDate(task.due_at)) return true;
+  const end = new Date(task.due_at).getTime();
+  return end > now;
+}
+function isOverdueAssignment(task, now = Date.now()) {
+  return task.kind === 'assignment' && task.status !== 'completed' && validDate(task.due_at) && new Date(task.due_at).getTime() < now;
+}
 function formatDate(value, options = {}) {
   if (!validDate(value)) return '时间待核对';
   return new Intl.DateTimeFormat('zh-CN', { timeZone: ZONE, ...options }).format(new Date(value));
@@ -131,10 +141,10 @@ function setView(view) {
   window.scrollTo({ top: 0, behavior: 'instant' });
 }
 function render() {
-  const pending = state.tasks.filter(task => task.status !== 'completed');
   const now = Date.now();
+  const pending = state.tasks.filter(task => isActionable(task, now));
   const upcoming = pending.filter(task => taskTime(task) && taskTime(task).getTime() >= now);
-  const overdue = pending.filter(task => task.kind !== 'exam' && taskTime(task) && taskTime(task).getTime() < now).length;
+  const overdue = pending.filter(task => isOverdueAssignment(task, now)).length;
   const startedExams = pending.filter(task => task.kind === 'exam' && taskTime(task) && taskTime(task).getTime() < now).length;
   const missingExamTime = pending.filter(task => task.kind === 'exam' && !taskTime(task)).length;
   $('#pendingCount').textContent = pending.length;
@@ -143,13 +153,13 @@ function render() {
   $('#examCount').innerHTML = `${upcoming.filter(task => task.kind === 'exam').length}<small>场考试</small>`;
   $('#todayLabel').textContent = formatDate(new Date(), { month: 'long', day: 'numeric', weekday: 'long' });
   $('#accountNudge').hidden = ['chaoxing', 'xiji'].some(source => ['authenticated', 'session_detected', 'session_saved'].includes(state.platforms?.[source]?.status));
-  if (!pending.length) $('#agendaSummary').textContent = state.tasks.length ? '所有安排都已完成，留一点时间给自己。' : '还没有安排。添加下一次截止，从容准备。';
+  if (!pending.length) $('#agendaSummary').textContent = state.tasks.length ? '当前没有待办安排，可在“全部”中查看历史记录。' : '还没有安排。添加下一次安排，从容准备。';
   else if (overdue || startedExams || missingExamTime) {
-    const details = [overdue ? `${overdue} 项已过截止` : '', startedExams ? `${startedExams} 场考试已开考` : '',
+    const details = [overdue ? `${overdue} 项作业已逾期` : '', startedExams ? `${startedExams} 场考试进行中` : '',
       missingExamTime ? `${missingExamTime} 场考试待补充开考时间` : ''].filter(Boolean).join('，');
-    $('#agendaSummary').textContent = `${pending.length} 项安排待完成，其中${details}。完成后记得勾选。`;
+    $('#agendaSummary').textContent = `${pending.length} 项待办安排，其中${details}。`;
   }
-  else $('#agendaSummary').textContent = `${pending.length} 项安排待完成。按自己的节奏，一件一件来。`;
+  else $('#agendaSummary').textContent = `${pending.length} 项待办安排，按时间准备即可。`;
   renderWeek();
   renderTasks();
   renderPlatforms();
@@ -170,7 +180,7 @@ function renderWeek() {
   const weekdayNames = ['一', '二', '三', '四', '五', '六', '日'];
   $('#weekStrip').innerHTML = weekdayNames.map((name, index) => {
     const day = addDays(weekStart, index);
-    const count = state.tasks.filter(task => task.status !== 'completed' && taskTime(task) && beijingDay(taskTime(task)) === day).length;
+    const count = state.tasks.filter(task => isActionable(task) && taskTime(task) && beijingDay(taskTime(task)) === day).length;
     return `<button class="week-day${day === today ? ' today' : ''}${filters.day === day ? ' selected' : ''}" data-day="${day}" aria-pressed="${filters.day === day}" aria-label="${shortDate(day)}，周${name}，${count}项待办">${day === today ? '<span class="today-label-mini">今天</span>' : ''}<span class="week-name">周${name}</span><span class="week-date">${Number(day.slice(8))}</span><span class="week-dot${count ? '' : ' blank'}" aria-hidden="true"></span></button>`;
   }).join('');
   $('#clearDateFilter').hidden = !filters.day;
@@ -184,8 +194,8 @@ function countdown(task) {
   if (!Number.isFinite(delta)) return { text: '请核对时间', urgent: true };
   if (task.kind === 'exam' && delta === 0) return { text: '现在开考', urgent: true };
   if (delta < 0) {
-    if (task.kind === 'exam') return { text: new Date(task.due_at).getTime() > Date.now() ? '考试中' : '已结束 · 待确认', urgent: false };
-    return { text: task.kind === 'lecture' ? '已开始' : '已过截止', urgent: true };
+    if (task.kind === 'exam') return { text: new Date(task.due_at).getTime() > Date.now() ? '考试中' : '已结束', urgent: false };
+    return { text: task.kind === 'lecture' ? '已开课' : '已逾期', urgent: task.kind === 'assignment' };
   }
   if (delta < 3600000) return { text: `剩余 ${Math.max(1, Math.ceil(delta / 60000))} 分钟`, urgent: true };
   if (delta <= 48 * 3600000) return { text: `剩余 ${Math.ceil(delta / 3600000)} 小时`, urgent: true };
@@ -193,6 +203,7 @@ function countdown(task) {
 }
 function renderTasks() {
   let tasks = state.tasks.filter(task => {
+    if (filters.status === 'pending' && !isActionable(task)) return false;
     if (filters.status !== 'all' && (task.status === 'completed' ? 'completed' : 'pending') !== filters.status) return false;
     if (filters.source !== 'all' && task.source !== filters.source) return false;
     if (filters.kind !== 'all' && task.kind !== filters.kind) return false;
@@ -220,9 +231,9 @@ function renderTasks() {
   }
   $('#taskList').innerHTML = Array.from(grouped, ([day, entries]) => {
     let title = day === today ? '今天' : day === addDays(today, 1) ? '明天' : day === 'unknown' ? '时间待补充' : shortDate(day);
-    const isPast = day !== 'unknown' && day < today;
+    const hasOverdueAssignment = entries.some(task => isOverdueAssignment(task));
     const weekday = day === 'unknown' ? '' : formatDate(`${day}T12:00:00+08:00`, { weekday: 'long' });
-    return `<section class="task-group"><h2 class="group-heading${isPast ? ' overdue' : ''}"><strong>${title}</strong><span>${weekday}${day === today || day === addDays(today, 1) ? ` · ${shortDate(day)}` : ''}</span></h2>${entries.map(taskRow).join('')}</section>`;
+    return `<section class="task-group"><h2 class="group-heading${hasOverdueAssignment ? ' overdue' : ''}"><strong>${title}</strong><span>${weekday}${day === today || day === addDays(today, 1) ? ` · ${shortDate(day)}` : ''}</span></h2>${entries.map(taskRow).join('')}</section>`;
   }).join('');
 }
 function taskRow(task) {

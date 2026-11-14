@@ -205,7 +205,7 @@ function taskFromEvent(event) {
     platformAttemptedAt: parsePlatformSync(uniqueMetadataField(notes, "平台最近尝试同步")),
     platformSyncResult: platformResultFromNotes(notes),
     offline: /线下|纸质/.test(notes) && /大学物理|大物/.test(course),
-    overdue: kind !== "exam" && due.getTime() < now.getTime() };
+    overdue: kind === "assignment" && due.getTime() < now.getTime() };
 }
 async function readTasks(calendarId) {
   let calendars;
@@ -275,13 +275,13 @@ function remaining(task) {
   if (ms < 3600000) label = `${Math.max(1, Math.ceil(ms / 60000))} 分钟`;
   else if (ms < 48 * 3600000) label = `${Math.ceil(ms / 3600000)} 小时`;
   else label = `${Math.ceil(ms / DAY)} 天`;
-  return `${task.overdue ? task.kind === "lecture" ? "已开始 " : "逾期 " : "剩 "}${label}`;
+  return `${task.overdue ? "逾期 " : "剩 "}${label}`;
 }
 function deadline(task) {
   if (!task.anchor) return "开考时间待补充";
   const year = beijingParts(task.anchor).year !== beijingParts(now).year;
   if (task.kind === "exam") return (task.calendarTimeChanged ? "备注 " : "") + dateText(task.anchor, year) + " 开考";
-  const prefix = task.kind === "lecture" ? task.overdue ? "已开始 " : "上课 " : task.overdue ? "已过截止 " : "截止 ";
+  const prefix = task.kind === "lecture" ? "上课 " : task.overdue ? "已过截止 " : "截止 ";
   return (task.calendarTimeChanged ? "备注" : "") + prefix + dateText(task.due, year);
 }
 function examEnd(task, compact) {
@@ -389,12 +389,12 @@ function makeWidget(tasks, family, error, calendarId, readAt, invalidCount = 0) 
   const runURL = URLScheme.forRunningScript();
   widget.url = `${runURL}${runURL.includes("?") ? "&" : "?"}preview=large` +
     (calendarId ? `&calendarId=${encodeURIComponent(calendarId)}` : "");
-  const future = tasks.filter(task => task.anchor && !task.overdue && (task.kind !== "exam" || task.examPhase === "upcoming"))
+  const future = tasks.filter(task => task.anchor && task.anchor >= now && (task.kind !== "exam" || task.examPhase === "upcoming"))
     .sort((a, b) => a.anchor - b.anchor);
   const active = tasks.filter(task => task.examPhase === "ongoing").sort((a, b) => a.anchor - b.anchor);
-  const missing = tasks.filter(task => task.kind === "exam" && !task.anchor);
-  const past = tasks.filter(task => task.overdue || task.examPhase === "ended").sort((a, b) => b.anchor - a.anchor);
-  const overdueCount = past.filter(task => task.overdue).length;
+  const missing = tasks.filter(task => task.kind === "exam" && !task.anchor && task.due >= now);
+  const past = tasks.filter(task => task.overdue).sort((a, b) => b.anchor - a.anchor);
+  const overdueCount = past.length;
   const primary = [...active, ...future, ...missing];
   const smallColors = !error && family === "small" && primary.length && urgency(primary[0]) ? taskColors(primary[0]) : null;
   if (smallColors) widget.backgroundColor = smallColors.background;
@@ -405,7 +405,7 @@ function makeWidget(tasks, family, error, calendarId, readAt, invalidCount = 0) 
     syncFooter(widget, [], family, null);
     return widget;
   }
-  if (!tasks.length) {
+  if (!primary.length && !past.length) {
     message(widget, invalidCount ? "有记录需要核对" : "近期没有课期待办", invalidCount ?
       `${invalidCount} 项课期记录格式异常。请检查日历备注，或在 Mac 程序核对后同步。` :
       "查询范围：过去 30 天至未来 60 天。以本机已收到的日历记录为准。", family);
@@ -426,7 +426,7 @@ function makeWidget(tasks, family, error, calendarId, readAt, invalidCount = 0) 
   }
   widget.addSpacer(family === "medium" ? 5 : 12);
   if (!primary.length && family !== "medium") {
-    text(widget, "未来 60 天暂无待办 · 以下为往期记录", 10, palette.urgent);
+    text(widget, "未来 60 天暂无待办 · 以下为逾期作业", 10, palette.urgent);
     widget.addSpacer(5);
   }
   if (family === "extraLarge") {
@@ -447,7 +447,7 @@ function makeWidget(tasks, family, error, calendarId, readAt, invalidCount = 0) 
     });
   }
   widget.addSpacer();
-  const remainingCount = Math.max(0, tasks.length - visible.length);
+  const remainingCount = Math.max(0, primary.length + past.length - visible.length);
   syncFooter(widget, tasks, family, readAt, palette.secondary,
     remainingCount ? ` · 另 ${remainingCount} 项` : "", invalidCount);
   return widget;

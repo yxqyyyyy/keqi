@@ -5,6 +5,7 @@ import { Check, CheckCheck, ChevronRight, Clock3, Plus, RefreshCw, Search, X } f
 import type { Task, Operation, Changes as EditableChanges } from "@/lib/keqi-model";
 
 type Changes = EditableChanges & { source?: "manual" };
+type AgendaTab = "pending" | "completed" | "all";
 type MobileState = {
   tasks: Task[];
   canonical_tasks: Task[];
@@ -85,9 +86,9 @@ function patchFor(task: Task, values: Changes): Operation | null {
   return { op_id: crypto.randomUUID(), action: "patch", task_id: task.id, base_revision: task.revision, base, changes };
 }
 
-function fieldValue(field: string, value: unknown) {
+function fieldValue(field: string, value: unknown, kind: Task["kind"] = "assignment") {
   if (field === "start_at" || field === "due_at") return value ? dateLabel(String(value), true) : "未填写";
-  if (field === "status") return value === "completed" ? "已完成" : "待完成";
+  if (field === "status") return value === "completed" ? "已完成" : kind === "assignment" ? "待完成" : "已安排";
   if (field === "kind") return KIND_LABEL[value as Task["kind"]] || String(value);
   return value === null || value === undefined || value === "" ? "未填写" : String(value);
 }
@@ -129,12 +130,13 @@ async function jsonRequest(path: string, body?: unknown): Promise<MobileState> {
 }
 
 function countdown(task: Task, now: number) {
+  if (task.kind === "assignment" && task.status === "completed") return "已完成";
   const time = anchor(task);
   if (time === null) return "补充开考时间";
   const remaining = time - now;
   if (remaining <= 0) {
     if (task.kind === "exam") return (validTime(task.due_at) ?? 0) > now ? "考试进行中" : "考试已结束";
-    return task.kind === "lecture" ? "已开课" : "已截止";
+    return task.kind === "lecture" ? "已开课" : "已逾期";
   }
   const verb = task.kind === "exam" ? "开考" : task.kind === "lecture" ? "开课" : "截止";
   if (remaining < 3600000) return `${Math.ceil(remaining / 60000)} 分钟后${verb}`;
@@ -142,12 +144,32 @@ function countdown(task: Task, now: number) {
   return "";
 }
 
+function isActionable(task: Task, now: number) {
+  if (task.deleted || task.status === "completed") return false;
+  if (task.kind === "assignment") return true;
+  const end = validTime(task.due_at);
+  return end === null || end > now;
+}
+
+function isUrgent(task: Task, now: number) {
+  const time = anchor(task);
+  return isActionable(task, now) && time !== null && time > now && time - now <= 86400000;
+}
+
+function agendaTasks(tasks: Task[], tab: AgendaTab, search: string, now: number) {
+  const query = search.trim().toLocaleLowerCase();
+  return tasks.filter(task => !task.deleted
+    && (tab === "all" || (tab === "pending" ? isActionable(task, now) : task.status === "completed"))
+    && (!query || `${task.title} ${task.course}`.toLocaleLowerCase().includes(query)))
+    .sort((a, b) => (anchor(a) ?? Infinity) - (anchor(b) ?? Infinity));
+}
+
 export default function MobileClient() {
   const [data, setData] = useState<MobileState | null>(null);
   const [error, setError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [tab, setTab] = useState<"pending" | "completed">("pending");
+  const [tab, setTab] = useState<AgendaTab>("pending");
   const [search, setSearch] = useState("");
   const [now, setNow] = useState(Date.now());
   const [editing, setEditing] = useState<Task | null | undefined>(undefined);
@@ -311,11 +333,11 @@ export default function MobileClient() {
   }
 
   const tasks = data?.tasks.filter(task => !task.deleted) ?? [];
-  const pending = tasks.filter(task => task.status !== "completed");
+  const pending = tasks.filter(task => isActionable(task, now));
   const queued = data?.operations.filter(item => item.status === "pending") ?? [];
   const conflicts = data?.operations.filter(item => item.status === "conflict" || item.status === "invalid") ?? [];
-  const urgent = (task: Task) => task.status !== "completed" && anchor(task) !== null && anchor(task)! > now && anchor(task)! - now <= 86400000;
-  const visible = tasks.filter(task => task.status === tab && (!search.trim() || `${task.title} ${task.course}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()))).sort((a, b) => (anchor(a) ?? Infinity) - (anchor(b) ?? Infinity));
+  const urgent = (task: Task) => isUrgent(task, now);
+  const visible = agendaTasks(tasks, tab, search, now);
   const urgentTasks = tab === "pending" ? visible.filter(urgent) : [];
   const otherTasks = visible.filter(task => !urgentTasks.includes(task));
   const lastSync = validTime(data?.last_mac_sync_at);
@@ -325,7 +347,7 @@ export default function MobileClient() {
     const taskQueued = queued.some(item => item.task_id === task.id);
     const taskConflict = conflicts.some(item => item.task_id === task.id);
     return <article className={`task-row${urgent(task) ? " is-urgent" : ""}${task.status === "completed" ? " is-completed" : ""}`} key={task.id}>
-      <button type="button" className="complete" disabled={busy} aria-label={`${task.status === "completed" ? "恢复待完成" : "标为已完成"} ${task.title}`} aria-pressed={task.status === "completed"} onClick={() => void toggleTask(task)}>{task.status === "completed" && <Check size={16} strokeWidth={2.5} />}</button>
+      <button type="button" className="complete" disabled={busy} aria-label={`${task.status === "completed" ? task.kind === "assignment" ? "恢复待完成" : "恢复安排" : "标为已完成"} ${task.title}`} aria-pressed={task.status === "completed"} onClick={() => void toggleTask(task)}>{task.status === "completed" && <Check size={16} strokeWidth={2.5} />}</button>
       <button type="button" className="task-content" disabled={busy} onClick={() => openEditor(task)} aria-label={`编辑 ${task.title}`}>
         <span className="task-topline"><span className="task-title">{task.title}</span><span className="task-date">{task.kind === "exam" ? task.start_at ? dateLabel(task.start_at) : "时间待补充" : dateLabel(task.due_at)}</span></span>
         <span className="task-meta"><span>{task.course || "未指定课程"}</span><span className="separator">·</span><span>{KIND_LABEL[task.kind]}</span><span className="time-note">{task.kind === "exam" ? task.start_at ? `${countdown(task, now) || "开考"} · ${dateLabel(task.due_at)} 结束` : "请补充开考时间以设置提醒" : countdown(task, now)}</span></span>
@@ -337,17 +359,17 @@ export default function MobileClient() {
   return <main className="shell">
     <header className="topbar"><a className="brand" href="/"><span className="brand-mark">期</span><span>课期</span></a><span className="topbar-caption">手机安排</span></header>
     <div className="sync-strip" aria-live="polite"><span className={`sync-dot${fresh ? " fresh" : ""}`} /><div>{data ? data.bridge_connected ? `Mac 最近同步 ${dateLabel(data.last_mac_sync_at, true)}` : "等待 Mac 首次连接" : "正在读取安排"}<small>时间均为北京时间</small></div><button type="button" className="icon-button" aria-label="刷新安排" disabled={refreshing} onClick={() => void refresh(true)}><RefreshCw size={17} className={refreshing ? "spinner" : undefined} /></button></div>
-    <div className="page-heading"><div><h1>我的安排</h1><p className={pending.some(urgent) ? "urgent-copy" : undefined}>{pending.some(urgent) ? `${pending.filter(urgent).length} 项安排将在 24 小时内到期` : `${pending.length} 项待完成`}</p></div><button type="button" className="button primary" onClick={() => openEditor(null)} disabled={!data || busy}><Plus size={17} />新增</button></div>
+    <div className="page-heading"><div><h1>我的安排</h1><p className={pending.some(urgent) ? "urgent-copy" : undefined}>{pending.some(urgent) ? `24 小时内有 ${pending.filter(urgent).length} 项安排` : `${pending.length} 项待办安排`}</p></div><button type="button" className="button primary" onClick={() => openEditor(null)} disabled={!data || busy}><Plus size={17} />新增</button></div>
     {(queued.length > 0 || conflicts.length > 0) && <div className="queue-notice" role="status"><p>{queued.length > 0 && `${queued.length} 项修改已保存到云端，等待 Mac 接收`}{conflicts.length > 0 && <a href="#conflicts">{conflicts.length} 项需要确认<ChevronRight size={12} style={{ display: "inline" }} /></a>}</p>{queued.length > 0 && <p>Mac 恢复运行并联网后，会接收修改并更新日历。</p>}</div>}
     {error && <div className="error-notice" role="alert">{error}{error.includes("登录") && <a href="/signin-with-chatgpt?return_to=%2F" target="_top">重新登录</a>}</div>}
-    <div className="toolbar"><div className="tabs" aria-label="安排状态"><button type="button" aria-pressed={tab === "pending"} onClick={() => setTab("pending")}>待完成</button><button type="button" aria-pressed={tab === "completed"} onClick={() => setTab("completed")}>已完成</button></div><label className="search"><Search size={18} /><span className="sr-only">搜索安排或课程</span><input value={search} onChange={event => setSearch(event.target.value)} type="search" placeholder="搜索课程或安排" /></label></div>
-    {!data ? <div className="loading" role="status">{error ? "暂时无法读取安排" : "正在读取安排…"}</div> : !visible.length ? <section className="empty"><CheckCheck size={32} strokeWidth={1.4} /><h2>{search ? "没有找到相关安排" : tab === "completed" ? "还没有已完成的安排" : "暂时没有待完成安排"}</h2><p>{search ? "试试其他名称或课程。" : data.bridge_connected ? "新增安排，或等待 Mac 读取课程。" : "Mac 首次连接后，这里会显示已有安排。"}</p>{!search && tab === "pending" && <button type="button" className="button secondary" onClick={() => openEditor(null)}>添加安排</button>}</section> : <>
+    <div className="toolbar"><div className="tabs" aria-label="安排状态"><button type="button" aria-pressed={tab === "pending"} onClick={() => setTab("pending")}>待办</button><button type="button" aria-pressed={tab === "completed"} onClick={() => setTab("completed")}>已完成</button><button type="button" aria-pressed={tab === "all"} onClick={() => setTab("all")}>全部安排</button></div><label className="search"><Search size={18} /><span className="sr-only">搜索安排或课程</span><input value={search} onChange={event => setSearch(event.target.value)} type="search" placeholder="搜索课程或安排" /></label></div>
+    {!data ? <div className="loading" role="status">{error ? "暂时无法读取安排" : "正在读取安排…"}</div> : !visible.length ? <section className="empty"><CheckCheck size={32} strokeWidth={1.4} /><h2>{search ? "没有找到相关安排" : tab === "completed" ? "还没有已完成的安排" : tab === "all" ? "暂时没有安排" : "暂时没有待办安排"}</h2><p>{search ? "试试其他名称或课程。" : data.bridge_connected ? "新增安排，或等待 Mac 读取课程。" : "Mac 首次连接后，这里会显示已有安排。"}</p>{!search && tab === "pending" && <button type="button" className="button secondary" onClick={() => openEditor(null)}>添加安排</button>}</section> : <>
       {urgentTasks.length > 0 && <section className="task-section urgent-section"><h2 className="group-heading">24 小时内<span>{urgentTasks.length} 项</span></h2><div className="task-list">{urgentTasks.map(taskRow)}</div></section>}
-      {otherTasks.length > 0 && <section className="task-section"><h2 className="group-heading">{tab === "completed" ? "已完成" : urgentTasks.length ? "其他安排" : "待完成"}<span>{otherTasks.length} 项</span></h2><div className="task-list">{otherTasks.map(taskRow)}</div></section>}
+      {otherTasks.length > 0 && <section className="task-section"><h2 className="group-heading">{tab === "completed" ? "已完成" : tab === "all" ? "全部安排" : urgentTasks.length ? "其他安排" : "待办安排"}<span>{otherTasks.length} 项</span></h2><div className="task-list">{otherTasks.map(taskRow)}</div></section>}
     </>}
     {conflicts.length > 0 && <section className="conflicts" id="conflicts"><h2>需要确认的修改</h2>{conflicts.map(operation => {
       const current = data?.canonical_tasks.find(task => task.id === operation.task_id) ?? operation.current;
-      return <article className="conflict-item" key={operation.op_id}><h3>{String(operation.changes.title || current?.title || "安排修改")}</h3><p>{operation.message || "Mac 中的安排已有其他修改，请选择保留哪个版本。"}</p>{operation.action === "delete" ? <p>手机操作为删除这项安排。</p> : <dl className="conflict-values">{Object.entries(operation.changes).filter(([field]) => field !== "source").map(([field, value]) => <div key={field}><dt>{FIELD_LABEL[field] || field}</dt><dd><span>Mac 当前</span>{current && !current.deleted ? fieldValue(field, current[field as keyof Task]) : "安排已删除"}</dd><dd><span>手机修改</span>{fieldValue(field, value)}</dd></div>)}</dl>}<div className="conflict-actions"><button type="button" className="button secondary" disabled={busy} onClick={() => void resolveConflict(operation, false)}>保留 Mac 版本</button><button type="button" className="button subtle" disabled={busy} onClick={() => void resolveConflict(operation, true)}>{operation.action === "delete" ? "仍然删除" : "采用手机修改"}</button></div></article>;
+      return <article className="conflict-item" key={operation.op_id}><h3>{String(operation.changes.title || current?.title || "安排修改")}</h3><p>{operation.message || "Mac 中的安排已有其他修改，请选择保留哪个版本。"}</p>{operation.action === "delete" ? <p>手机操作为删除这项安排。</p> : <dl className="conflict-values">{Object.entries(operation.changes).filter(([field]) => field !== "source").map(([field, value]) => <div key={field}><dt>{FIELD_LABEL[field] || field}</dt><dd><span>Mac 当前</span>{current && !current.deleted ? fieldValue(field, current[field as keyof Task], current.kind) : "安排已删除"}</dd><dd><span>手机修改</span>{fieldValue(field, value, operation.changes.kind ?? current?.kind)}</dd></div>)}</dl>}<div className="conflict-actions"><button type="button" className="button secondary" disabled={busy} onClick={() => void resolveConflict(operation, false)}>保留 Mac 版本</button><button type="button" className="button subtle" disabled={busy} onClick={() => void resolveConflict(operation, true)}>{operation.action === "delete" ? "仍然删除" : "采用手机修改"}</button></div></article>;
     })}</section>}
     <footer className="footer">手机修改会先保存在云端。Mac 恢复运行后自动接收，并同步到日历。{data?.platform_synced_at && <><br />最近读取平台 {dateLabel(data.platform_synced_at, true)}</>}</footer>
     <dialog ref={dialog} aria-labelledby="edit-title" onCancel={event => { if (busy) event.preventDefault(); else { setEditing(undefined); retryOperation.current = null; } }}>

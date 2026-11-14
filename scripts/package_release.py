@@ -65,6 +65,7 @@ MOBILE_CLOUD_FILES = frozenset({
     "drizzle/meta/_journal.json", "drizzle/meta/0000_snapshot.json",
     "worker/index.ts", "public/favicon.svg", "tests/keqi-model.test.mjs", "tests/keqi-sync.test.mjs",
     "tests/keqi-mobile-request.test.mjs",
+    "tests/keqi-mobile-agenda.test.mjs",
     "scripts/build-verified.sh", "scripts/execution-profile.mjs", "scripts/install-ci.mjs",
     "scripts/install-ci.sh", "scripts/install-pnpm.sh", "scripts/npm-install.mjs", "scripts/pnpm-install.mjs",
     "scripts/run-framework.mjs", "scripts/sites-env.mjs", "scripts/sites-env.sh", "scripts/tool-environment.mjs",
