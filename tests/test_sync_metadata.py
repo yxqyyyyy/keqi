@@ -1,4 +1,5 @@
 import itertools
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta
@@ -7,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from server import Application
 from studyreminder.core import TZ
-from studyreminder.sync_status import platform_synced_at, sync_info
+from studyreminder.sync_status import platform_synced_at, sync_info, sync_signature
 
 
 START = "2026-10-18T08:00:00+08:00"
@@ -130,6 +131,51 @@ class SyncMetadataTests(unittest.TestCase):
         self.assertTrue(info["sources"]["xiji"]["scope_changed"])
         self.assertFalse(info["sources"]["chaoxing"]["scope_changed"])
         self.assertIsNone(platform_synced_at(self.app.store))
+
+    def test_keyword_only_signatures_preserve_existing_history(self):
+        collection = self.app.store.settings()['collection']
+        for source, keys in ((None, ('chaoxing_homework', 'chaoxing_exams', 'xiji')),
+                             ('chaoxing', ('chaoxing_homework', 'chaoxing_exams')),
+                             ('xiji', ('xiji',))):
+            expected = {'course_scope': {key: collection['course_scope'][key] for key in keys}}
+            if source != 'xiji':
+                expected['homework_year'] = collection.get('homework_year')
+            self.assertEqual(sync_signature(collection, source), json.dumps(expected, sort_keys=True, ensure_ascii=True))
+
+    def test_all_course_mode_invalidates_only_affected_source(self):
+        self.scan()
+        self.app.store.update_settings({'collection': {'all_course_types': ['xiji']}})
+        info = self.app.sync_metadata()
+        self.assertTrue(info['scope_changed'])
+        self.assertTrue(info['sources']['xiji']['scope_changed'])
+        self.assertFalse(info['sources']['chaoxing']['scope_changed'])
+        self.assertIsNone(platform_synced_at(self.app.store))
+
+    def test_empty_keyword_all_course_source_is_configured_and_can_verify(self):
+        self.app.store.update_settings({'collection': {'course_scope': {
+            'chaoxing_homework': [], 'chaoxing_exams': [], 'xiji': []}, 'all_course_types': ['xiji']}})
+        info = sync_info(self.app.store)
+        self.assertTrue(info['sources']['xiji']['configured'])
+        self.assertFalse(info['sources']['chaoxing']['configured'])
+        result = outcome()
+        result['source_results']['chaoxing']['auth_status'] = 'disabled'
+        self.scan(result, sources={'xiji'})
+        info = self.app.sync_metadata()
+        self.assertEqual(info['last_success_at'], FINISH)
+        self.assertEqual(info['sources']['xiji']['last_success_at'], FINISH)
+        self.assertIsNone(info['sources']['chaoxing']['last_success_at'])
+
+    def test_disabled_result_cannot_verify_an_enabled_all_course_source(self):
+        self.app.store.update_settings({'collection': {'course_scope': {
+            'chaoxing_homework': [], 'chaoxing_exams': [], 'xiji': []},
+            'all_course_types': ['chaoxing_homework', 'xiji']}})
+        result = outcome()
+        result['source_results']['xiji']['auth_status'] = 'disabled'
+        self.scan(result)
+        info = self.app.sync_metadata()
+        self.assertEqual(info['sources']['chaoxing']['last_success_at'], FINISH)
+        self.assertIsNone(info['sources']['xiji']['last_success_at'])
+        self.assertIsNone(info['last_success_at'])
 
     def test_year_change_invalidates_chaoxing_and_global_but_not_xiji(self):
         self.scan()

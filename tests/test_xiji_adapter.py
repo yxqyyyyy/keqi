@@ -419,6 +419,57 @@ class XijiTests(unittest.TestCase):
         self.assertFalse(result["auth"]["authenticated"])
         self.assertTrue(result["diagnostics"]["coverage"]["complete"])
 
+    def test_all_courses_includes_unlisted_courses_beyond_the_old_four_course_limit(self):
+        extra = (("99", "大学英语"), ("100", "线性代数"), ("101", "思想政治理论"))
+
+        def expanded_main(current):
+            choices = ''.join('<span class="dropdown-item-course' + (' font-weight-bold' if key == current else '')
+                              + '" value="' + key + '">' + name + '</span>' for key, name in extra)
+            return course_main(current) + choices
+
+        class ExpandedRequest(CourseRequest):
+            def get(self, url, **kwargs):
+                response = super().get(url, **kwargs)
+                response.body = response.body.replace(course_main(self.current), expanded_main(self.current))
+                return response
+
+            def post(self, url, **kwargs):
+                response = super().post(url, **kwargs)
+                response.body = response.body.replace(course_main(self.current), expanded_main(self.current))
+                return response
+
+        context = Context()
+        context.request = ExpandedRequest()
+        result = collect_xiji(context, course_scope=None)
+        self.assertEqual({item['course'] for item in result['candidates']},
+                         {'计算机组成与体系结构', '离散数学', *(name for _, name in extra)})
+        self.assertTrue(result['diagnostics']['coverage']['all_courses'])
+        self.assertFalse(result['diagnostics']['coverage']['disabled'])
+        self.assertTrue(result['diagnostics']['coverage']['complete'])
+        self.assertEqual(context.request.current, '9')
+        self.assertTrue(result['diagnostics']['coverage']['initial_course_restored'])
+        self.assertEqual(result['warnings'], [])
+
+    def test_all_courses_requires_an_observed_course_directory_for_full_coverage(self):
+        result = collect_xiji(Context(), course_scope=None)
+        self.assertTrue(result['auth']['authenticated'])
+        self.assertFalse(result['diagnostics']['coverage']['complete'])
+        self.assertFalse(result['diagnostics']['coverage']['disabled'])
+        self.assertEqual(result['candidates'], [])
+
+    def test_all_courses_marks_failures_partial_and_restores_selected_course(self):
+        context = Context()
+        context.request = CourseRequest(fail_course='87')
+        result = collect_xiji(context, course_scope=None)
+        self.assertFalse(result['diagnostics']['coverage']['complete'])
+        self.assertEqual(context.request.current, '9')
+        self.assertTrue(result['diagnostics']['coverage']['initial_course_restored'])
+        self.assertEqual({item['course'] for item in result['candidates']}, {'计算机组成与体系结构'})
+
+    def test_all_course_diagnostics_keep_only_observed_course_labels(self):
+        source = course_main('9') + '<p>PRIVATE PERSONAL PROFILE NAME</p>'
+        self.assertNotIn('PRIVATE PERSONAL', str(_course_contexts(_Tree(source).root, None)))
+
     def test_single_course_scope_can_start_outside_scope_and_restores_it(self):
         context = Context()
         context.request = CourseRequest()
@@ -729,6 +780,18 @@ class XijiTests(unittest.TestCase):
         self.assertEqual(marker['element_child_tags'], ['i'])
         self.assertTrue(marker['direct_cell_child'])
         self.assertNotIn('PRIVATE', str(evidence))
+
+    def test_header_status_diagnostics_capture_bounded_leaf_markers_only(self):
+        source = ('<table><tr><th>#</th><th>题目</th><th>提交状态</th></tr>'
+                  '<tr><th>1.</th><td><span class="badge">PRIVATE QUESTION CONTENT</span></td>'
+                  '<td><span class="badge badge-success">待开始</span></td></tr></table>')
+        evidence = _submission_evidence(_Tree(source).root)
+        row = evidence['tables'][0]['rows'][1]
+        status = next(cell for cell in row['metadata_cells'] if cell['column'] == 2)
+        self.assertEqual(status['status_marker_fragments'], ['待开始'])
+        self.assertNotIn('PRIVATE', str(evidence))
+        oversized = source.replace('待开始', 'long' * 30)
+        self.assertNotIn('status_marker_fragments', str(_submission_evidence(_Tree(oversized).root)))
 
     def test_campus_session_reuse_recovers_empty_main_and_rechecks_authentication(self):
         request = CampusRequest(blank_main=True)

@@ -24,6 +24,7 @@ class CourseSettingsTests(unittest.TestCase):
         self.assertEqual(store.tasks(), [])
         self.assertFalse(store.settings()['physics']['enabled'])
         self.assertTrue(all(v == [] for v in store.settings()['collection']['course_scope'].values()))
+        self.assertEqual(store.settings()['collection']['all_course_types'], [])
         self.assertEqual(Store(self.path).settings(), store.settings())
 
     def test_legacy_migration_preserves_implicit_courses_and_physics(self):
@@ -34,6 +35,7 @@ class CourseSettingsTests(unittest.TestCase):
         self.assertEqual(cfg['collection']['course_scope'], LEGACY_COURSE_SCOPE)
         self.assertEqual(cfg['collection']['homework_year'], 2026)
         self.assertTrue(cfg['physics']['enabled'])
+        self.assertEqual(cfg['collection']['all_course_types'], [])
         self.assertEqual(Store(self.path).settings(), cfg)
 
     def test_migration_keeps_explicitly_disabled_physics(self):
@@ -57,6 +59,36 @@ class CourseSettingsTests(unittest.TestCase):
         store.update_settings({'collection': {'course_scope': {'chaoxing_homework': ['概率论']}, 'homework_year': 2026}})
         self.assertIsNone(store.settings()['collection']['homework_year_binding'])
         self.assertIsNone(store.get_value('daily_last_success'))
+
+    def test_all_course_modes_preserve_keywords_and_proven_year_binding(self):
+        store = Store(self.path)
+        scope = {'chaoxing_homework': ['概率论'], 'chaoxing_exams': ['大学物理'], 'xiji': ['离散数学']}
+        binding = {'year': 2026, 'courseid': 'course-a', 'clazzid': 'class-a'}
+        store.patch_settings({'collection': {'course_scope': scope, 'homework_year': 2026,
+                                            'homework_year_binding': binding}})
+        store.set_value('daily_last_success', '2026-11-20T08:00:00+08:00')
+        cfg = store.update_settings({'collection': {'all_course_types': ['xiji', 'chaoxing_homework']}})['collection']
+        self.assertEqual(cfg['all_course_types'], ['chaoxing_homework', 'xiji'])
+        self.assertEqual(cfg['course_scope'], scope)
+        self.assertEqual(cfg['homework_year_binding'], binding)
+        self.assertIsNone(store.get_value('daily_last_success'))
+        self.assertEqual(Store(self.path).settings()['collection']['all_course_types'], cfg['all_course_types'])
+        self.assertEqual(Store(Path(self.temp.name) / 'other.sqlite3').settings()['collection']['all_course_types'], [])
+        # Changing another setting must not drop enabled all-course categories.
+        store.update_settings({'collection': {'auto_scan': True}})
+        self.assertEqual(store.settings()['collection']['all_course_types'], cfg['all_course_types'])
+        store.update_settings({'collection': {'all_course_types': []}})
+        self.assertEqual(store.settings()['collection']['course_scope'], scope)
+        self.assertEqual(store.settings()['collection']['homework_year_binding'], binding)
+
+    def test_invalid_all_course_modes_leave_all_settings_unchanged(self):
+        store = Store(self.path)
+        before = store.settings()
+        for invalid in (None, True, 'xiji', {}, ['unknown'], [7], [[]],
+                        ['xiji', 'xiji'], ['chaoxing_homework', 'chaoxing_exams', 'xiji', 'xiji']):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                store.update_settings({'physics': {'enabled': True}, 'collection': {'all_course_types': invalid}})
+            self.assertEqual(store.settings(), before)
 
     def test_invalid_scope_or_year_leaves_all_settings_unchanged(self):
         store = Store(self.path)

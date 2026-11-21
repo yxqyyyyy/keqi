@@ -10,6 +10,12 @@ def sync_signature(collection, source=None):
     scope = collection.get("course_scope", {})
     keys = FIELDS[source] if source else tuple(key for values in FIELDS.values() for key in values)
     value = {"course_scope": {key: scope.get(key, []) for key in keys}}
+    all_types = collection.get("all_course_types", [])
+    active_all = [key for key in keys if key in all_types]
+    # Retain the historical signature when every category still uses keywords.
+    # A source's freshness must not change when another source switches mode.
+    if active_all:
+        value["all_course_types"] = active_all
     if source != "xiji":
         value["homework_year"] = collection.get("homework_year")
     return json.dumps(value, sort_keys=True, ensure_ascii=True)
@@ -20,6 +26,7 @@ def sync_info(store):
     record = store.get_value("collection_sync", {})
     collection = store.settings()["collection"]
     scope = collection.get("course_scope", {})
+    all_types = collection.get("all_course_types", [])
 
     def visible(item, signature):
         basis = item.get("success_scope") if item.get("last_success_at") else item.get("attempt_scope")
@@ -31,7 +38,7 @@ def sync_info(store):
     public["sources"] = {}
     for source, keys in FIELDS.items():
         item = visible(record.get("sources", {}).get(source, {}), sync_signature(collection, source))
-        item["configured"] = any(scope.get(key) for key in keys)
+        item["configured"] = any(scope.get(key) or key in all_types for key in keys)
         if not item["configured"]:
             item["last_result"] = "disabled"
         public["sources"][source] = item

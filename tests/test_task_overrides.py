@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -53,6 +54,102 @@ class TaskOverrideTests(TemporaryStoreTests):
         original = self.store.import_tasks([platform_task()])[0]
         self.store.put_task({"status": "completed"}, original["id"], mark_overrides=False)
         self.assertEqual(self.store.import_tasks([platform_task()])[0]["status"], "completed")
+
+    def test_reissued_assignment_does_not_inherit_a_previous_windows_completion(self):
+        original = self.store.import_tasks([platform_task(
+            source_key="course:9:assignment:6457", status="completed",
+            start_at="2026-05-13T00:00:00+08:00", due_at="2026-05-20T00:00:00+08:00")])[0]
+        # Reproduce a stored legacy calendar reference, which public edits
+        # intentionally cannot set or change.
+        with self.store.connect() as db:
+            body = json.loads(db.execute("SELECT body FROM tasks WHERE id=?", (original["id"],)).fetchone()[0])
+            body["calendar_id"] = "calendar-marker"
+            db.execute("UPDATE tasks SET body=? WHERE id=?", (json.dumps(body), original["id"]))
+        self.store.apply_task_patch(original["id"], {"title": "我保存的作业名", "notes": "自己的备注"})
+        renewed = platform_task(source_key=original["source_key"], start_at="2026-11-21T00:00:00+08:00",
+                                due_at="2026-11-28T00:00:00+08:00")
+        result = self.store.import_tasks([renewed])[0]
+        self.assertEqual(result["id"], original["id"])
+        self.assertEqual(result["source_key"], original["source_key"])
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(result["due_at"], renewed["due_at"])
+        self.assertEqual(result["calendar_id"], "calendar-marker")
+        self.assertEqual(result["title"], "我保存的作业名")
+        self.assertEqual(result["notes"], "自己的备注")
+        self.assertEqual(len(self.store.tasks()), 1)
+        self.assertEqual(self.store.import_tasks([renewed])[0], result)
+
+    def test_deadline_extension_of_the_same_release_preserves_completion(self):
+        original = self.store.import_tasks([platform_task(
+            source_key="course:9:assignment:6457", status="completed",
+            start_at="2026-11-21T00:00:00+08:00", due_at="2026-11-28T00:00:00+08:00")])[0]
+        result = self.store.import_tasks([platform_task(
+            source_key=original["source_key"], start_at=original["start_at"],
+            due_at="2026-12-01T00:00:00+08:00")])[0]
+        self.assertEqual(result["status"], "completed")
+
+    def test_reissued_assignment_preserves_explicit_manual_completion(self):
+        original = self.store.import_tasks([platform_task(
+            source_key="course:9:assignment:6457", start_at="2026-05-13T00:00:00+08:00",
+            due_at="2026-05-20T00:00:00+08:00")])[0]
+        self.store.apply_task_patch(original["id"], {"status": "completed"})
+        result = self.store.import_tasks([platform_task(
+            source_key=original["source_key"], start_at="2026-11-21T00:00:00+08:00",
+            due_at="2026-11-28T00:00:00+08:00")])[0]
+        self.assertEqual(result["status"], "completed")
+
+    def test_confirmed_completed_reissued_assignment_stays_completed(self):
+        original = self.store.import_tasks([platform_task(
+            source_key="course:9:assignment:6457", status="completed",
+            start_at="2026-05-13T00:00:00+08:00", due_at="2026-05-20T00:00:00+08:00")])[0]
+        result = self.store.import_tasks([platform_task(
+            source_key=original["source_key"], status="completed", start_at="2026-11-21T00:00:00+08:00",
+            due_at="2026-11-28T00:00:00+08:00")])[0]
+        self.assertEqual(result["status"], "completed")
+
+    def test_verified_chaoxing_work_can_start_a_new_release_window(self):
+        original = self.store.import_tasks([platform_task(
+            source="chaoxing", source_key="course:9:class:4:work:6457", status="completed",
+            start_at="2026-05-13T00:00:00+08:00", due_at="2026-05-20T00:00:00+08:00")])[0]
+        result = self.store.import_tasks([platform_task(
+            source="chaoxing", source_key=original["source_key"], start_at="2026-11-21T00:00:00+08:00",
+            due_at="2026-11-28T00:00:00+08:00")])[0]
+        self.assertEqual(result["id"], original["id"])
+        self.assertEqual(result["status"], "pending")
+
+    def test_deleted_assignment_is_not_restored_by_a_new_release_window(self):
+        original = self.store.import_tasks([platform_task(
+            source_key="course:9:assignment:6457", status="completed",
+            start_at="2026-05-13T00:00:00+08:00", due_at="2026-05-20T00:00:00+08:00")])[0]
+        deleted = self.store.delete_task(original["id"])
+        result = self.store.import_tasks([platform_task(
+            source_key=original["source_key"], start_at="2026-11-21T00:00:00+08:00",
+            due_at="2026-11-28T00:00:00+08:00")])[0]
+        self.assertEqual(result, deleted)
+        self.assertEqual(self.store.tasks(), [])
+
+    def test_reissue_requires_a_distinct_verified_window(self):
+        cases = [
+            {"start_at": None},
+            {"start_at": "2026-05-20T00:00:00+08:00"},
+            {"source_key": "page:assignment"},
+            {"source": "manual", "source_key": "course:9:assignment:6457"},
+            {"kind": "exam"},
+        ]
+        for index, changes in enumerate(cases):
+            with self.subTest(changes=changes):
+                key = changes.get("source_key", f"course:9:assignment:{6457 + index}")
+                source = changes.get("source", "xiji")
+                kind = changes.get("kind", "assignment")
+                original = self.store.import_tasks([platform_task(
+                    source=source, source_key=key, kind=kind, status="completed",
+                    start_at="2026-05-13T00:00:00+08:00", due_at="2026-05-20T00:00:00+08:00")])[0]
+                result = self.store.import_tasks([platform_task(
+                    source=source, source_key=key, kind=kind,
+                    start_at=changes.get("start_at", "2026-11-21T00:00:00+08:00"),
+                    due_at="2026-11-28T00:00:00+08:00")])[0]
+                self.assertEqual(result["id"], original["id"])
+                self.assertEqual(result["status"], "completed")
 
     def test_positive_submission_cancels_a_manually_reopened_task(self):
         original = self.store.import_tasks([platform_task(status="completed")])[0]

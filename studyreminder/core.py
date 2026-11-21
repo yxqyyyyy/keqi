@@ -18,6 +18,7 @@ DEFAULT_SETTINGS = {
     "physics": {"enabled": False, "time": "24:00", "until": None},
     "calendar": {"name": "作业与考试", "identifier": None, "auto_sync": False},
     "collection": {"auto_scan": False, "interval_minutes": 1440, "homework_year": None,
+                   "all_course_types": [],
                    "course_scope": {"chaoxing_homework": [], "chaoxing_exams": [], "xiji": []}},
     "daily": {"enabled": True, "time": "08:00"},
 }
@@ -128,6 +129,29 @@ def _preserved_notes(*values):
         if value and value not in result:
             result += ("\n\n" if result else "") + value
     return result if len(result) <= 6000 else None
+
+
+def _is_reissued_assignment(incoming, existing, overrides):
+    """Detect a new release window under the same platform assignment ID."""
+    source = incoming.get("source")
+    key = incoming.get("source_key", "")
+    identity_pattern = {
+        "xiji": r"(?:course:[0-9]+:)?assignment:[0-9]+",
+        "chaoxing": r"course:[0-9]+:class:[0-9]+:work:[0-9]+",
+    }.get(source)
+    if (identity_pattern is None or not re.fullmatch(identity_pattern, key)
+            or existing.get("source") != source or existing.get("source_key") != key
+            or incoming.get("kind") != "assignment" or existing.get("kind") != "assignment"
+            or incoming.get("status") != "pending" or existing.get("status") != "completed"
+            or "status" in overrides or not incoming.get("start_at")):
+        return False
+    try:
+        old_due = parse_datetime(existing.get("due_at"))
+        new_start = parse_datetime(incoming["start_at"])
+        new_due = parse_datetime(incoming.get("due_at"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return new_start > old_due and new_due > old_due
 
 
 def _apply_task_overrides(incoming, existing, overrides):
@@ -286,6 +310,14 @@ class Store:
                 if not isinstance(cfg["auto_scan"], bool):
                     raise ValueError("auto_scan 必须是布尔值")
                 result["collection"]["auto_scan"] = cfg["auto_scan"]
+            if "all_course_types" in cfg:
+                values = cfg["all_course_types"]
+                fields = DEFAULT_SETTINGS["collection"]["course_scope"]
+                if (not isinstance(values, list) or len(values) > len(fields)
+                        or any(not isinstance(value, str) or value not in fields for value in values)
+                        or len(set(values)) != len(values)):
+                    raise ValueError("全部课程范围应为不重复的学习通作业、学习通考试或希冀类别")
+                result["collection"]["all_course_types"] = [key for key in fields if key in values]
             if "course_scope" in cfg:
                 scope = cfg["course_scope"]
                 fields = DEFAULT_SETTINGS["collection"]["course_scope"]
@@ -313,7 +345,7 @@ class Store:
                 raise ValueError("每日同步开关格式不正确")
             result["daily"]["time"] = validate_daily_time(result["daily"]["time"])
         result = self.patch_settings({k: result[k] for k in ("physics", "collection", "daily") if k in patch}, reset_future_physics="physics" in patch)
-        if any(result["collection"].get(k) != previous_collection.get(k) for k in ("course_scope", "homework_year")):
+        if any(result["collection"].get(k) != previous_collection.get(k) for k in ("course_scope", "homework_year", "all_course_types")):
             self.set_value("daily_last_success", None)
         self.ensure_physics()
         return result
@@ -596,10 +628,13 @@ class Store:
                         # deleted locally. Retain its identity as a tombstone.
                         result.append(self._write_task(db, previous, key, previous, overrides, deleted=True))
                         continue
-                    # A stale import must not undo a user's completed state.
+                    # Completion belongs to its release window. A platform can
+                    # reuse an assignment ID after the old window has closed.
                     item["id"] = row[0]
                     source_completed = item["status"] == "completed"
-                    if existing["status"] == "completed":
+                    keep_completed = (existing["status"] == "completed"
+                                      and not _is_reissued_assignment(item, existing, overrides))
+                    if keep_completed:
                         item["status"] = "completed"
                     if fingerprint:
                         # Keep user notes on later reimports after the legacy
@@ -611,7 +646,7 @@ class Store:
                     item = _apply_task_overrides(item, previous, overrides)
                     # A positive submission result always cancels reminders,
                     # including after a user previously reopened the task.
-                    if existing["status"] == "completed" or source_completed:
+                    if keep_completed or source_completed:
                         item["status"] = "completed"
                     result.append(self._write_task(db, item, key, previous, overrides))
                 else:

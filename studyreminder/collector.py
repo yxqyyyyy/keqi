@@ -514,6 +514,10 @@ class BrowserCollector:
                         course_scope = options.get("course_scope", {})
                         if not isinstance(course_scope, dict):
                             raise ValueError("课程范围配置格式不正确")
+                        all_course_types = options.get("all_course_types", [])
+                        if (not isinstance(all_course_types, list) or
+                                any(not isinstance(field, str) or field not in {"chaoxing_homework", "chaoxing_exams", "xiji"} for field in all_course_types)):
+                            raise ValueError("全部课程配置格式不正确")
                         verified_chaoxing = False
                         verified_xiji = False
                         current_mtime = Path(chaoxing_adapter.__file__).stat().st_mtime_ns
@@ -521,8 +525,8 @@ class BrowserCollector:
                             chaoxing_adapter = importlib.reload(chaoxing_adapter)
                             adapter_mtime = current_mtime
                         result = chaoxing_adapter.collect_chaoxing(context,
-                            homework_courses=course_scope.get("chaoxing_homework", chaoxing_adapter.HOMEWORK_COURSES),
-                            exam_courses=course_scope.get("chaoxing_exams", chaoxing_adapter.EXAM_COURSES),
+                            homework_courses=None if "chaoxing_homework" in all_course_types else course_scope.get("chaoxing_homework", chaoxing_adapter.HOMEWORK_COURSES),
+                            exam_courses=None if "chaoxing_exams" in all_course_types else course_scope.get("chaoxing_exams", chaoxing_adapter.EXAM_COURSES),
                             homework_year=options.get("homework_year"))
                         status_updates.extend(result.get("status_updates", []))
                         diagnostics["chaoxing"] = result.get("diagnostics", {})
@@ -537,10 +541,10 @@ class BrowserCollector:
                         try:
                             from . import xiji_adapter
                             xiji_adapter = importlib.reload(xiji_adapter)
-                            xiji_scope = course_scope.get("xiji", xiji_adapter.COURSE_SCOPE)
+                            xiji_scope = None if "xiji" in all_course_types else course_scope.get("xiji", xiji_adapter.COURSE_SCOPE)
                             xiji_window_open = browser_context is not None and any(
                                 platform_for(page.url) == "xiji" for page in browser_context.pages)
-                            if xiji_window_open and xiji_scope:
+                            if xiji_window_open and (xiji_scope is None or xiji_scope):
                                 # Independent cookie jars can still share the
                                 # same server-side JSESSIONID/course state.
                                 # Never POST course switches while the user is

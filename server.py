@@ -112,10 +112,10 @@ class Application:
                 self.store.set_value("collection_last_error", {"at": now_iso(), "message": str(exc)})
 
     @staticmethod
-    def configured_sources(scope):
+    def configured_sources(scope, all_course_types=()):
         return {source for source, fields in {
             "chaoxing": ("chaoxing_homework", "chaoxing_exams"), "xiji": ("xiji",)
-        }.items() if any(scope.get(field) for field in fields)}
+        }.items() if any(scope.get(field) or field in all_course_types for field in fields)}
 
     def _sync_record(self):
         record = self.store.get_value("collection_sync")
@@ -138,7 +138,8 @@ class Application:
                 record.update(last_attempt_at=old_at, last_result="partial")
                 old_verified = {source for source, outcome in old.get("source_results", {}).items()
                                 if source in PLATFORM_SOURCES and self.verified_source(outcome)}
-                configured = self.configured_sources(self.store.settings()["collection"]["course_scope"])
+                collection = self.store.settings()["collection"]
+                configured = self.configured_sources(collection["course_scope"], collection.get("all_course_types", []))
                 if (isinstance(old, dict) and old.get("coverage_complete") is True and
                         configured and configured <= old_verified):
                     record.update(last_success_at=old_at, last_result="success")
@@ -173,7 +174,7 @@ class Application:
         with self.retry_lock:
             collection = self.store.settings()["collection"]
             scope = collection["course_scope"]
-            active = self.configured_sources(scope) & (PLATFORM_SOURCES if sources is None else set(sources))
+            active = self.configured_sources(scope, collection.get("all_course_types", [])) & (PLATFORM_SOURCES if sources is None else set(sources))
             generations = self.store.get_value("collection_retry", {}).get("auth_generations", {})
             attempt = {"id": secrets.token_hex(8), "at": now_iso(), "config": collection, "sources": sorted(active),
                        "auth_generations": {source: generations.get(source, 0) for source in active}}
@@ -216,7 +217,7 @@ class Application:
                 else:
                     item["last_result"] = "scope_changed" if changed else ("failed" if failed else "partial")
                 item.pop("active_attempt", None)
-            full = bool(verified and self.configured_sources(scope) <= verified and result.get("coverage_complete") is True)
+            full = bool(verified and self.configured_sources(scope, collection.get("all_course_types", [])) <= verified and result.get("coverage_complete") is True)
             if full:
                 record.update(last_success_at=finished_at, success_scope=sync_signature(collection), last_result="success")
             else:
@@ -229,7 +230,7 @@ class Application:
         """A daily read may verify healthy platforms in separate attempts."""
         with self.retry_lock:
             current = self.store.settings()["collection"]
-            configured = self.configured_sources(current["course_scope"])
+            configured = self.configured_sources(current["course_scope"], current.get("all_course_types", []))
             if sync_signature(current) != sync_signature(collection) or not configured or not configured <= completed_sources:
                 return False
             record = self._sync_record()
@@ -299,12 +300,13 @@ class Application:
             return None
         collection_cfg = self.store.settings()["collection"]
         scope = collection_cfg["course_scope"]
-        configured = self.configured_sources(scope)
+        configured = self.configured_sources(scope, collection_cfg.get("all_course_types", []))
         tasks = self.store.tasks()
         task_sources = {t["id"]: t.get("source") for t in tasks}
         with self.retry_lock:
             state = self.retry_state(now, cfg["time"])
-            signature = json.dumps(scope, sort_keys=True, ensure_ascii=True)
+            signature = (sync_signature(collection_cfg) if collection_cfg.get("all_course_types") else
+                         json.dumps(scope, sort_keys=True, ensure_ascii=True))
             if state["daily"].get("scope") != signature:
                 state["daily"].update(scope=signature, attempts=0, completed_sources=[], next_attempt_at=None)
             blocked = set(state["blocked_sources"])
@@ -396,6 +398,7 @@ class Application:
         if confirmed_year != datetime.now(TZ).year:
             year = None
         scope = dict(cfg["course_scope"])
+        all_course_types = list(cfg.get("all_course_types", []))
         omitted = PLATFORM_SOURCES - sources if sources is not None else set()
         with self.retry_lock:
             current_generations = self.store.get_value("collection_retry", {}).get("auth_generations", {})
@@ -404,7 +407,10 @@ class Application:
         for source in omitted:
             for field in (("chaoxing_homework", "chaoxing_exams") if source == "chaoxing" else ("xiji",)):
                 scope[field] = []
+                if field in all_course_types:
+                    all_course_types.remove(field)
         result = self.collector.request("scan", {"homework_year": year, "course_scope": scope,
+                                                "all_course_types": all_course_types,
                                                 "preserve_disabled_status": sorted(omitted)})
         def discard_replaced_sessions():
             current_generations = self.store.get_value("collection_retry", {}).get("auth_generations", {})
@@ -426,7 +432,7 @@ class Application:
                 self.refresh_auth_retry(source, outcome.get("auth_status"),
                                         expected_generation=auth_generations.get(source))
         current = self.store.settings()["collection"]
-        if any(current.get(k) != cfg.get(k) for k in ("course_scope", "homework_year")):
+        if any(current.get(k) != cfg.get(k) for k in ("course_scope", "homework_year", "all_course_types")):
             raise ValueError("读取期间课程设置已改变，请按新范围重新同步")
         if result.get("homework_year_binding"):
             self.store.patch_settings({"collection": {"homework_year_binding": result["homework_year_binding"]}})
@@ -437,7 +443,7 @@ class Application:
         for update in result.get("status_updates", []):
             existing = known.get((update.get("source"), update.get("source_key")))
             if existing and update.get("status") == "completed" and existing["status"] != "completed":
-                self.store.put_task({"status": "completed"}, existing["id"])
+                self.store.put_task({"status": "completed"}, existing["id"], mark_overrides=False)
                 completed += 1
         if completed:
             self.calendar.sync_if_enabled()
@@ -460,7 +466,7 @@ class Application:
         added = len(imported_ids - tasks_before.keys())
         completed = sum(t["status"] != "completed" and tasks_after.get(task_id, {}).get("status") == "completed"
                         for task_id, t in tasks_before.items())
-        full_scope = sources is None or self.configured_sources(cfg["course_scope"]) <= sources
+        full_scope = sources is None or self.configured_sources(cfg["course_scope"], cfg.get("all_course_types", [])) <= sources
         with self.retry_lock:
             discard_replaced_sessions()
             if result.get("coverage_complete") and full_scope:

@@ -207,3 +207,35 @@ console.log('Desktop phone-update polling and focus refresh checks passed');
   assert.equal(rendered, 1, 'an older response cannot restore stale phone state');
   console.log('Concurrent desktop reads preserve the latest phone state');
 })().catch(error => { console.error(error); process.exitCode = 1; });
+
+// Exercise the settings form through its real submit handler, including all-only categories.
+(async () => {
+  const controls = new Map();
+  let posted;
+  const settingsUI = {
+    state: { settings: { collection: { course_scope: { chaoxing_homework: ['概率论'], chaoxing_exams: [], xiji: [] },
+      all_course_types: ['chaoxing_homework', 'chaoxing_exams', 'xiji'], homework_year: 2026 } } },
+    $: selector => {
+      if (!controls.has(selector)) controls.set(selector, { value: '', checked: false, classList: { toggle() {} },
+        handlers: {}, addEventListener(name, callback) { this.handlers[name] = callback; } });
+      return controls.get(selector);
+    },
+    syncTime: () => '', beijingDay: () => '2026-11-21',
+    busy: async (_button, _label, action) => action(),
+    api: async (_path, options) => { posted = JSON.parse(options.body); },
+    refresh: async () => true, toast() {},
+  };
+  vm.createContext(settingsUI);
+  vm.runInContext(section('const COURSE_SELECTIONS =', 'const ZONE =') +
+    section('function renderSettings()', 'function openTask(') +
+    section("$('#courseScopeForm').addEventListener", "$('#physicsForm').addEventListener"), settingsUI);
+  settingsUI.renderSettings();
+  assert.equal(controls.get('#allXijiAssignments').checked, true);
+  assert.equal(controls.get('#xijiCourses').disabled, true);
+  assert.equal(controls.get('#chaoxingHomeworkCourses').value, '概率论');
+  assert.equal((controls.get('#courseScopeSummary').textContent.match(/全部课程/g) || []).length, 3);
+  await controls.get('#courseScopeForm').handlers.submit({ preventDefault() {}, currentTarget: {} });
+  assert.deepEqual(posted.collection.all_course_types, ['chaoxing_homework', 'chaoxing_exams', 'xiji']);
+  assert.deepEqual(posted.collection.course_scope.xiji, []);
+  console.log('All-course settings render and save checks passed');
+})().catch(error => { console.error(error); process.exitCode = 1; });

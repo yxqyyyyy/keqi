@@ -3,6 +3,11 @@
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 const SOURCE_NAMES = { chaoxing: '学习通', xiji: '希冀平台', manual: '手动添加', physics: '大物周作业' };
+const COURSE_SELECTIONS = [
+  { field: 'chaoxing_homework', checkbox: '#allChaoxingHomework', input: '#chaoxingHomeworkCourses', label: '学习通作业' },
+  { field: 'chaoxing_exams', checkbox: '#allChaoxingExams', input: '#chaoxingExamCourses', label: '学习通考试' },
+  { field: 'xiji', checkbox: '#allXijiAssignments', input: '#xijiCourses', label: '希冀作业' },
+];
 const ZONE = 'Asia/Shanghai';
 let state = { tasks: [], settings: {}, platforms: {}, calendar_sync: {} };
 let filters = { status: 'pending', source: 'all', kind: 'all', search: '', day: null };
@@ -283,12 +288,15 @@ function renderPlatforms() {
 function renderSettings() {
   const collection = state.settings?.collection || {};
   const scope = collection.course_scope || {};
-  $('#chaoxingHomeworkCourses').value = (scope.chaoxing_homework || []).join('\n');
-  $('#chaoxingExamCourses').value = (scope.chaoxing_exams || []).join('\n');
-  $('#xijiCourses').value = (scope.xiji || []).join('\n');
+  const allTypes = collection.all_course_types || [];
+  for (const option of COURSE_SELECTIONS) {
+    $(option.input).value = (scope[option.field] || []).join('\n');
+    $(option.checkbox).checked = allTypes.includes(option.field);
+    $(option.input).disabled = $(option.checkbox).checked;
+  }
   $('#homeworkYear').value = collection.homework_year || '';
-  const parts = [['学习通作业', scope.chaoxing_homework], ['学习通考试', scope.chaoxing_exams], ['希冀', scope.xiji]]
-    .filter(([, values]) => values?.length).map(([name, values]) => `${name}：${values.join('、')}`);
+  const parts = COURSE_SELECTIONS.filter(option => allTypes.includes(option.field) || scope[option.field]?.length)
+    .map(option => `${option.label}：${allTypes.includes(option.field) ? '全部课程' : scope[option.field].join('、')}`);
   $('#courseScopeSummary').textContent = parts.length ? parts.join('；') : '尚未设置课程，请先到“设置 → 我的课程”填写。';
   const sync = state.calendar_sync || {};
   const calendar = state.settings?.calendar || {};
@@ -524,6 +532,9 @@ $('#syncCloudButton').addEventListener('click', event => busy(event.currentTarge
 }));
 $('#sidebarSync').addEventListener('click', event => { setView('settings'); syncCalendar(event.currentTarget); });
 $('#physicsTimeMode').addEventListener('change', () => { $('#physicsCustomLabel').hidden = $('#physicsTimeMode').value !== 'custom'; });
+for (const option of COURSE_SELECTIONS) {
+  $(option.checkbox).addEventListener('change', () => { $(option.input).disabled = $(option.checkbox).checked; });
+}
 $('#courseScopeForm').addEventListener('submit', async event => {
   event.preventDefault();
   $('#courseScopeError').textContent = '';
@@ -531,9 +542,10 @@ $('#courseScopeForm').addEventListener('submit', async event => {
     try {
       const lines = selector => [...new Set($(selector).value.split(/\r?\n/).map(s => s.trim()).filter(Boolean))];
       const course_scope = { chaoxing_homework: lines('#chaoxingHomeworkCourses'), chaoxing_exams: lines('#chaoxingExamCourses'), xiji: lines('#xijiCourses') };
+      const all_course_types = COURSE_SELECTIONS.filter(option => $(option.checkbox).checked).map(option => option.field);
       const homework_year = $('#homeworkYear').value ? Number($('#homeworkYear').value) : null;
       if (homework_year !== null && homework_year !== Number(beijingDay().slice(0, 4))) throw new Error('仅可确认当年的缺年份日期；其他年份请手动填写完整截止时间。');
-      await api('/api/settings', { method: 'PUT', body: JSON.stringify({ collection: { course_scope, homework_year } }) });
+      await api('/api/settings', { method: 'PUT', body: JSON.stringify({ collection: { course_scope, all_course_types, homework_year } }) });
       await refresh({ silent: true });
       toast('课程范围已保存，可前往“平台接入”立即同步。');
     } catch (error) { $('#courseScopeError').textContent = error.message; }

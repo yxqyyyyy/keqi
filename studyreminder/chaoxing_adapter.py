@@ -195,14 +195,17 @@ class _LoginRequired(_ReadError):
 
 
 class _Reader:
-    def __init__(self, context, budget=65):
+    def __init__(self, context, budget=65, max_requests=100):
         self.context = context
+        self.budget = budget
+        self.max_requests = max_requests
         self.deadline = time.monotonic() + budget
         self.count = 0
         self.routes = []
 
     def diagnostics(self):
-        return {"requests": self.count, "routes": self.routes}
+        return {"requests": self.count, "request_limit": self.max_requests,
+                "budget_seconds": self.budget, "routes": self.routes}
 
     def get(self, url, params=None):
         if params:
@@ -214,7 +217,7 @@ class _Reader:
                 self.routes.append({**route, "result": "blocked_route"})
                 raise _ReadError("平台返回了不在只读列表范围内的地址，已停止读取（" + route["host"] + route["path"] + "）")
             remaining = self.deadline - time.monotonic()
-            if remaining < 1 or self.count >= 100:
+            if remaining < 1 or self.count >= self.max_requests:
                 raise _ReadError("本次采集达到时间或请求数上限，结果可能不完整，请稍后重试")
             if self.count:
                 time.sleep(min(0.2, max(0, remaining - 0.5)))
@@ -353,6 +356,83 @@ def _courses(tree):
         name = next((v.strip() for v in names if v.strip()), anchor.attrs.get("title") or anchor.text() or "课程 " + fields["courseid"])
         found[(fields["courseid"], fields["clazzid"])] = {**fields, "name": name[:200]}
     return list(found.values())
+
+
+def _course_page_options(tree, fid):
+    """Read explicitly offered directory pages on the current school's route."""
+    options, unresolved = [], False
+    page_fields = {"page", "pagenum", "pageindex", "currentpage", "pagesize"}
+    position_fields = page_fields - {"pagesize"}
+    base_fields = {"coursetype": "1", "coursefid": fid, "courseteacherid": "0", "courseorderby": "0"}
+    for node in tree.walk():
+        if node.tag not in {"a", "button"}:
+            continue
+        if ("disabled" in node.attrs or node.attrs.get("aria-disabled") == "true"
+                or node.has_class("disabled")):
+            continue
+        next_control = bool(re.fullmatch(r"(?:下一页|下页|加载更多|更多课程)[\s>»›]*", node.text()))
+        href = node.attrs.get("href", "")
+        try:
+            url = urljoin(COURSES, href)
+            parsed = urlparse(url)
+            query = parse_qs(parsed.query)
+        except ValueError:
+            unresolved = unresolved or next_control
+            continue
+        fields = {key.lower(): values[0] for key, values in query.items() if len(values) == 1}
+        has_page = bool(position_fields.intersection(fields))
+        valid = (_safe_url(url) and parsed.path == urlparse(COURSES).path and has_page
+                 and len(fields) == len(query)
+                 and not set(fields) - page_fields - set(base_fields)
+                 and all(fields.get(key, value) == value for key, value in base_fields.items())
+                 and all(re.fullmatch(r"\d{1,6}", value) for key, value in fields.items() if key in page_fields))
+        if valid:
+            # Keep the server's parameter spelling while fixing the current
+            # school's base fields; do not carry signatures or action URLs.
+            page = {key: values[0] for key, values in query.items() if key.lower() in page_fields}
+            if page not in options:
+                options.append(page)
+        elif next_control:
+            unresolved = True
+    return options, unresolved
+
+
+def _course_directory(reader, fid):
+    """Traverse offered list pages, retaining bounded read/timeout guarantees."""
+    base = {"courseType": 1, "courseFid": fid, "courseTeacherid": 0, "courseOrderBy": 0}
+    pending, scheduled, courses = [{}], {()}, {}
+    pages_read, recognized, complete, warnings = 0, False, True, []
+    while pending:
+        page = pending.pop(0)
+        if pages_read >= 10:
+            complete = False
+            warnings.append("学习通课程列表超过本次 10 页读取上限，覆盖尚未完成")
+            break
+        try:
+            _, tree = reader.get(COURSES, {**base, **page})
+        except _LoginRequired:
+            raise
+        except _ReadError as exc:
+            complete = False
+            warnings.append("学习通课程列表分页读取未完成：" + str(exc))
+            break
+        pages_read += 1
+        entries = _courses(tree)
+        page_recognized = bool(entries or re.search(r"暂无(?:相关)?课程|没有(?:相关)?课程|暂未加入(?:任何)?课程", tree.text()))
+        recognized = recognized or page_recognized
+        complete = complete and page_recognized
+        for item in entries:
+            courses[(item["courseid"], item["clazzid"])] = item
+        offered, unresolved = _course_page_options(tree, fid)
+        complete = complete and not unresolved
+        if unresolved:
+            warnings.append("学习通课程列表存在未识别的翻页控件，课程覆盖尚未完成")
+        for next_page in offered:
+            identity = tuple(sorted((key.lower(), value) for key, value in next_page.items()))
+            if identity not in scheduled:
+                scheduled.add(identity)
+                pending.append(next_page)
+    return list(courses.values()), pages_read, recognized, complete, warnings
 
 
 def _completion_status(value):
@@ -849,9 +929,13 @@ def _exam_rows(tree, warnings, course_names=None, unidentified_rows=None, status
 
 
 def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EXAM_COURSES, homework_year=None):
-    """Return candidates and explicit limitations, using only authenticated GETs."""
-    homework_courses = tuple(name.strip() for name in homework_courses if isinstance(name, str) and name.strip())
-    exam_courses = tuple(name.strip() for name in exam_courses if isinstance(name, str) and name.strip())
+    """Read authenticated metadata; None selects all courses, an empty list disables."""
+    homework_courses = None if homework_courses is None else tuple(
+        name.strip() for name in homework_courses if isinstance(name, str) and name.strip())
+    exam_courses = None if exam_courses is None else tuple(
+        name.strip() for name in exam_courses if isinstance(name, str) and name.strip())
+    homework_enabled = homework_courses is None or bool(homework_courses)
+    exams_enabled = exam_courses is None or bool(exam_courses)
     candidates, warnings = [], []
     unidentified_exam_rows = []
     work_time_evidence = []
@@ -862,8 +946,11 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
     exam_awaiting_review_list_navigation = []
     exam_status_options = []
     year_binding = None
-    reader = _Reader(context)
+    all_courses = homework_courses is None or exam_courses is None
+    reader = _Reader(context, budget=90, max_requests=200) if all_courses else _Reader(context)
     coverage = {"courses_found": 0, "courses_in_scope": 0, "courses_out_of_scope": 0, "courses_attempted": 0,
+                "course_lists_read": 0, "course_list_recognized": False, "course_list_complete": False,
+                "all_homework_courses": homework_courses is None, "all_exam_courses": exam_courses is None,
                 "work_lists_read": 0, "work_lists_empty": 0, "work_lists_unrecognized": 0,
                 "work_details_read": 0, "work_items_incomplete": 0, "courses_completed": 0,
                 "courses_without_work_module": 0, "exam_lists_read": 0, "exam_list_recognized": False,
@@ -872,9 +959,9 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                 "exam_awaiting_review_list_available": False, "exam_awaiting_review_lists_read": 0,
                 "exam_awaiting_review_list_recognized": False,
                 "exam_rows_in_scope": 0, "exam_rows_unrecognized": 0, "exam_rows_incomplete": 0,
-                "homework_scope_missing": list(homework_courses),
-                "homework_disabled": not homework_courses, "exams_disabled": not exam_courses,
-                "disabled": not homework_courses and not exam_courses, "complete": False}
+                "homework_scope_missing": list(homework_courses or ()),
+                "homework_disabled": not homework_enabled, "exams_disabled": not exams_enabled,
+                "disabled": not homework_enabled and not exams_enabled, "complete": False}
     auth = {"authenticated": False, "status": "unverified", "message": "尚未检查", "signals": []}
     if coverage["disabled"]:
         coverage["complete"] = True
@@ -888,7 +975,7 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                     "diagnostics": {**reader.diagnostics(), "coverage": coverage, "unidentified_exam_rows": unidentified_exam_rows,
                                     "work_time_evidence": work_time_evidence, "work_status_evidence": work_status_evidence,
                                     "homework_year_binding": year_binding}}
-        if exam_courses:
+        if exams_enabled:
             # Read global exams before course traversal so a long homework list cannot starve them.
             try:
                 _, exam_tree = reader.get(EXAMS)
@@ -944,44 +1031,57 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
             except _ReadError as exc:
                 warnings.append(str(exc))
         fid = _number(base_source, "fid") or _inputs(base_tree).get("fid", "")
-        if not homework_courses:
+        if not homework_enabled:
             pass
         elif not re.fullmatch(r"\d+", fid or ""):
             warnings.append("个人空间未提供学校 fid，无法可靠读取我学的课；未使用其他学校的默认值")
         else:
-            _, course_tree = reader.get(COURSES, {"courseType": 1, "courseFid": fid, "courseTeacherid": 0, "courseOrderBy": 0})
-            courses = _courses(course_tree)
+            courses, pages_read, recognized, directory_complete, directory_warnings = _course_directory(reader, fid)
+            coverage.update(course_lists_read=pages_read, course_list_recognized=recognized,
+                            course_list_complete=directory_complete)
+            warnings.extend(directory_warnings)
             coverage["courses_found"] = len(courses)
-            if not courses:
+            if not courses and not recognized:
                 warnings.append("课程列表未识别到真实课程 ID；可能尚未加载、没有课程或平台页面已变化，这不表示没有作业")
-            courses = [course for course in courses if any(name in course["name"] for name in homework_courses if name)]
+            if homework_courses is not None:
+                courses = [course for course in courses if any(name in course["name"] for name in homework_courses)]
             coverage["courses_in_scope"] = len(courses)
-            coverage["homework_scope_missing"] = [keyword for keyword in homework_courses
+            coverage["homework_scope_missing"] = [keyword for keyword in homework_courses or ()
                 if not any(keyword in course["name"] for course in courses)]
             coverage["courses_out_of_scope"] = coverage["courses_found"] - len(courses)
             if coverage["homework_scope_missing"] and coverage["courses_found"]:
                 warnings.append("课程列表中未发现指定的学习通作业课程（" + "、".join(coverage["homework_scope_missing"]) + "），请核对课程名配置")
-            confirmed_year = None
             if homework_year is not None:
-                if len(courses) == 1:
+                if homework_courses is None:
+                    config = homework_year if isinstance(homework_year, dict) else {}
+                    year = config.get("year")
+                    matches = [course for course in courses if config.get("courseid") == course["courseid"]
+                               and config.get("clazzid") == course["clazzid"]]
+                    if (isinstance(year, int) and not isinstance(year, bool) and 2000 <= year < 2100
+                            and len(matches) == 1):
+                        year_binding = {"year": year, "courseid": matches[0]["courseid"], "clazzid": matches[0]["clazzid"]}
+                    else:
+                        warnings.append("全部课程模式仅接受已确认的课程与班级年份绑定；其他课程缺少年份时需核对")
+                elif len(courses) == 1:
                     only_course = courses[0]
                     config = homework_year if isinstance(homework_year, dict) else {
                         "year": homework_year, "courseid": only_course["courseid"], "clazzid": only_course["clazzid"]}
                     year = config.get("year")
                     if (isinstance(year, int) and not isinstance(year, bool) and 2000 <= year < 2100
                             and config.get("courseid") == only_course["courseid"] and config.get("clazzid") == only_course["clazzid"]):
-                        confirmed_year = year
                         year_binding = {"year": year, "courseid": only_course["courseid"], "clazzid": only_course["clazzid"]}
                     else:
                         warnings.append("用户确认年份的课程绑定或年份值与当前课程不符，未补年份")
                 else:
                     warnings.append("用户确认的作业年份仅能绑定唯一课程；当前未能唯一匹配，未补年份")
             for course in courses:
-                if time.monotonic() >= reader.deadline - 1 or reader.count >= 100:
+                if time.monotonic() >= reader.deadline - 1 or reader.count >= reader.max_requests:
                     warnings.append("本次采集达到时间或请求数上限，结果可能不完整，请稍后重试")
                     break
                 coverage["courses_attempted"] += 1
                 prefix = course["name"][:60] + "："
+                confirmed_year = year_binding["year"] if year_binding and all(
+                    year_binding[key] == course[key] for key in ("courseid", "clazzid")) else None
                 try:
                     params = {key: course[key] for key in ("courseid", "clazzid", "cpi")}
                     _, middle = reader.get(MIDDLE, {**params, "ismooc2": 1, "v": 2})
@@ -1067,7 +1167,7 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                     raise
                 except _ReadError as exc:
                     warnings.append(prefix + str(exc))
-                    if time.monotonic() >= reader.deadline - 1 or reader.count >= 100:
+                    if time.monotonic() >= reader.deadline - 1 or reader.count >= reader.max_requests:
                         break
     except _LoginRequired as exc:
         auth = {"authenticated": False, "status": "not_authenticated", "message": str(exc), "signals": []}
@@ -1075,14 +1175,15 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
     except Exception as exc:
         warnings.append(str(exc) if isinstance(exc, _ReadError) else "平台返回了未支持的页面结构，本次采集未完成，请人工核对")
     if coverage["courses_found"]:
-        warnings.append("学习通指定作业课程覆盖：匹配 " + str(coverage["courses_in_scope"]) + " 门，已尝试 "
+        warnings.append(("学习通全部作业课程覆盖：发现 " if homework_courses is None else "学习通指定作业课程覆盖：匹配 ") + str(coverage["courses_in_scope"]) + " 门，已尝试 "
                         + str(coverage["courses_attempted"]) + " 门，读到作业列表 "
                         + str(coverage["work_lists_read"]) + " 门（其中明确无作业 "
                         + str(coverage["work_lists_empty"]) + " 门、结构未识别 "
                         + str(coverage["work_lists_unrecognized"]) + " 门），作业详情 "
-                        + str(coverage["work_details_read"]) + " 项。其他课程按你的范围配置跳过。")
-    if exam_courses:
-        warnings.append("学习通仅采集指定课程的作业与考试；考试当前读取全局列表，课程内独立考试可能遗漏，候选仍需本人核对。")
+                        + str(coverage["work_details_read"]) + " 项。" + ("" if homework_courses is None else "其他课程按你的范围配置跳过。"))
+    if exams_enabled:
+        warnings.append(("学习通采集全部课程的全局考试列表；" if exam_courses is None else "学习通仅采集指定课程的作业与考试；考试当前读取全局列表，")
+                        + "课程内独立考试可能遗漏，候选仍需本人核对。")
     unique_updates, conflicting_updates = {}, set()
     exam_deadlines = {}
     for item in candidates:
@@ -1103,11 +1204,13 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
     unique = {item["source_key"]: item for item in candidates if item["source_key"] not in conflicting_updates}
     # Only a complete metadata/status read may satisfy the daily schedule.
     # Confirmed submissions need no deadline to cancel an existing reminder.
-    homework_complete = not homework_courses or (coverage["courses_in_scope"] > 0 and not coverage["homework_scope_missing"]
+    homework_complete = not homework_enabled or (coverage["course_list_complete"]
+        and (coverage["courses_in_scope"] > 0 or (homework_courses is None and coverage["course_list_recognized"]))
+        and not coverage["homework_scope_missing"]
         and coverage["courses_completed"] == coverage["courses_in_scope"]
         and coverage["work_lists_read"] == coverage["courses_in_scope"]
         and coverage["work_lists_unrecognized"] == 0 and coverage["work_items_incomplete"] == 0)
-    exams_complete = not exam_courses or (coverage["exam_lists_read"] == 1 and coverage["exam_list_recognized"]
+    exams_complete = not exams_enabled or (coverage["exam_lists_read"] == 1 and coverage["exam_list_recognized"]
         and coverage["exam_rows_unrecognized"] == 0 and coverage["exam_rows_incomplete"] == 0
         and (not coverage["exam_completed_list_available"] or (
             coverage["exam_completed_lists_read"] == 1 and coverage["exam_completed_list_recognized"]))

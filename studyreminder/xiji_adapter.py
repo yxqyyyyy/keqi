@@ -388,6 +388,8 @@ def _course_controls(tree, course_scope=COURSE_SCOPE):
 
 def _course_contexts(tree, course_scope=COURSE_SCOPE):
     """Retain minimal course-labelled nodes and numeric course-control data."""
+    if course_scope is None:
+        course_scope = tuple(entry["name"] for entry in _course_entries(tree, None))
     result = []
     for node in tree.walk():
         if node.tag in {"root", "html", "body", "script", "style"}:
@@ -647,7 +649,8 @@ def _assignments(tree, course, warnings, course_scope=COURSE_SCOPE):
             title = anchor.text().strip()
         if not title:
             titles = [node.text().strip() for node in container.walk() if node.tag in {"h2", "h3", "h4", "h5", "h6"}
-                      and node.text().strip() and not _scoped(node.text(), course_scope)]
+                      and node.text().strip() and (node.text().strip() != course if course_scope is None
+                                                 else not _scoped(node.text(), course_scope))]
             title = titles[0] if len(titles) == 1 else ""
         text = " ".join(container.text().split())
         due = _dates(text, r"(?:截止时间|截止日期|结束时间|提交截止|作业截止)")
@@ -898,6 +901,11 @@ def _submission_evidence(tree):
                 parent = parent.parent
             if parent is table:
                 rows.append(node)
+        status_column = None
+        if rows:
+            headers = [child for child in rows[0].children if isinstance(child, _Node) and child.tag in {"th", "td"}]
+            status_column = next((index for index, child in enumerate(headers)
+                                  if "提交" in child.text() and "状态" in child.text()), None)
         row_evidence = []
         for row_index, row in enumerate(rows[:50]):
             cells = [child for child in row.children if isinstance(child, _Node) and child.tag in {"th", "td"}]
@@ -909,6 +917,16 @@ def _submission_evidence(tree):
                 direct_elements = [element_shape(child, cell) for child in cell.children if isinstance(child, _Node)]
                 if direct_elements:
                     info["direct_element_nodes"] = direct_elements[:15]
+                if column == status_column and row_index > 0:
+                    fragments = []
+                    for marker in cell.children:
+                        if (isinstance(marker, _Node) and marker.tag == "span" and marker.has_class("badge")
+                                and not any(isinstance(child, _Node) for child in marker.children)):
+                            value = " ".join(marker.text().split())
+                            if value and len(value) <= 80:
+                                fragments.append(value)
+                    if fragments:
+                        info["status_marker_fragments"] = fragments[:5]
                 if re.fullmatch(r"\d{1,3}[.．、]", text):
                     info["numbered_label"] = int(text[:-1])
                 if text in {"提交状态", "题目", "题号", "#"}:
@@ -1001,19 +1019,22 @@ def _assignment_detail(tree, entry, course, course_id, warnings):
 
 def collect_xiji(context, course_scope=COURSE_SCOPE):
     """Read configured courses and restore the initial selection when known."""
-    course_scope = tuple(name.strip() for name in course_scope if isinstance(name, str) and name.strip())
-    reader = _Reader(context)
+    all_course_mode = course_scope is None
+    course_scope = None if all_course_mode else tuple(name.strip() for name in course_scope if isinstance(name, str) and name.strip())
+    reader = _Reader(context, budget=60 if all_course_mode else 35)
+    if all_course_mode:
+        reader.request_limit = 120
     candidates, warnings = [], []
     auth = {"authenticated": False, "status": "unverified", "message": "尚未检查", "signals": []}
-    coverage = {"courses_in_scope": list(course_scope), "current_course_identified": False,
+    coverage = {"courses_in_scope": list(course_scope or ()), "all_courses": all_course_mode, "current_course_identified": False,
                 "initial_course_identified": False,
                 "course_lists_read": 0, "assignment_links_found": 0, "assignment_candidates": 0,
                 "assignment_details_read": 0, "assignment_statuses_verified": 0, "assignment_statuses_unverified": 0,
-                "courses_completed": [], "disabled": not course_scope, "complete": False}
+                "courses_completed": [], "disabled": course_scope == (), "complete": False}
     controls, course_contexts, list_structure, main_hints, list_hints = [], [], {}, {}, {}
     structures, original, initial_main, switched = {}, None, None, False
     submission_evidence = {}
-    if not course_scope:
+    if course_scope == ():
         coverage["complete"] = True
         auth.update(status="disabled", message="未设置希冀课程，已跳过采集")
         return {"candidates": [], "warnings": [], "auth": auth,
@@ -1031,6 +1052,9 @@ def collect_xiji(context, course_scope=COURSE_SCOPE):
             # Keep the initial dropdown selection even when outside the user's
             # collection scope, so a scoped course can be visited and restored.
             all_courses = _course_entries(main, None)
+            coverage["courses_discovered"] = [entry["name"] for entry in all_courses]
+            if all_course_mode and not all_courses:
+                raise _ReadError("希冀未返回可核实的课程目录，本次全课程读取未完成，请稍后重试")
             original = next((entry for entry in all_courses if entry["current"]), None)
             courses = [entry for entry in all_courses if _scoped(entry["name"], course_scope)]
             if len(_current_course_names(main, course_scope)) > 1:
@@ -1057,9 +1081,11 @@ def collect_xiji(context, course_scope=COURSE_SCOPE):
                 if not courses:
                     courses = [{"id": "", "name": course, "current": True}]
                 active_id = original["id"] if original else ""
-                if len(courses) > 4:
-                    warnings.append("希冀匹配课程超过4门，本次按请求上限仅核对前4门，其余课程仍需人工核对")
-                for target in courses[:4]:
+                course_limit = 30 if all_course_mode else 4
+                if len(courses) > course_limit:
+                    warnings.append("希冀匹配课程超过" + str(course_limit) + "门，本次按请求上限仅核对前"
+                                    + str(course_limit) + "门，其余课程仍需人工核对")
+                for target in courses[:course_limit]:
                     try:
                         course_main = main
                         if target["id"] and target["id"] != active_id:
@@ -1129,7 +1155,8 @@ def collect_xiji(context, course_scope=COURSE_SCOPE):
                     route = _route(urljoin(MAIN, switch.attrs.get("href", "")))
                     warnings.append("发现课程切换链接，尚未确认其只读行为，未访问（" + route["host"] + route["path"] + "）")
             coverage["complete"] = bool(courses and len(coverage["courses_completed"]) == len(courses)
-                and all(any(scope in name for name in coverage["courses_completed"]) for scope in course_scope))
+                and (bool(all_courses) if all_course_mode else
+                     all(any(scope in name for name in coverage["courses_completed"]) for scope in course_scope)))
             if not coverage["complete"]:
                 warnings.append("希冀配置范围内的作业尚未全部核对，未覆盖课程或时间缺失项仍需人工核对")
     except _LoginRequired as exc:

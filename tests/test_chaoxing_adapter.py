@@ -78,6 +78,40 @@ class FilteredExamContext(Context):
         self.request.get = get
 
 
+def course_card(course_id, name):
+    return ('<li><a href="https://mooc1.chaoxing.com/visit/stucoursemiddle?courseid=' + course_id
+            + '&amp;clazzid=22&amp;cpi=33"><span class="course-name">' + name + '</span></a></li>')
+
+
+class CourseDirectoryContext(Context):
+    def __init__(self, pages, dates="截止时间:2026-11-28 23:00", failed_course=None):
+        super().__init__()
+        original_get = self.request.get
+
+        def get(url, **kwargs):
+            path, query = urlparse(url).path, parse_qs(urlparse(url).query)
+            if path == "/mooc2-ans/visit/courselistdata":
+                self.request.calls.append((url, kwargs))
+                response = pages.get(query.get("pageNum", ["1"])[0])
+                if isinstance(response, Exception):
+                    raise response
+                return Response(response)
+            if path == "/mooc2/work/list":
+                self.request.calls.append((url, kwargs))
+                course_id = query["courseId"][0]
+                if course_id == failed_course:
+                    raise RuntimeError("synthetic timeout")
+                return Response('<li onclick="goTask(this);" data="https://mooc1.chaoxing.com/mooc-ans/mooc2/work/task?courseId='
+                                + course_id + '&amp;classId=22&amp;workId=44"><p class="overHidden2">作业</p>'
+                                '<p class="status">未提交</p><p>' + dates + '</p></li>')
+            if path == "/mooc-ans/mooc2/work/task":
+                self.request.calls.append((url, kwargs))
+                return Response('<p>' + dates + '</p>')
+            return original_get(url, **kwargs)
+
+        self.request.get = get
+
+
 class AdapterTests(unittest.TestCase):
     def setUp(self):
         self.sleep = patch("studyreminder.chaoxing_adapter.time.sleep")
@@ -251,6 +285,107 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result["auth"]["status"], "disabled")
         self.assertTrue(result["diagnostics"]["coverage"]["complete"])
         self.assertTrue(result["diagnostics"]["coverage"]["disabled"])
+
+    def test_none_homework_scope_reads_other_courses_and_keeps_exam_disable(self):
+        context = CourseDirectoryContext({"1": course_card("11", "概率论") + course_card("12", "大学英语")})
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        self.assertEqual({item["course"] for item in result["candidates"]}, {"概率论", "大学英语"})
+        self.assertEqual({item["source_key"] for item in result["candidates"]},
+                         {"course:11:class:22:work:44", "course:12:class:22:work:44"})
+        coverage = result["diagnostics"]["coverage"]
+        self.assertTrue(coverage["all_homework_courses"])
+        self.assertFalse(coverage["homework_disabled"])
+        self.assertEqual(coverage["courses_out_of_scope"], 0)
+        self.assertTrue(coverage["complete"])
+        self.assertFalse(any("examlist" in url for url, _ in context.request.calls))
+
+    def test_none_exam_scope_reads_other_courses_without_homework_traversal(self):
+        row = '<tr class="dataTr" coursename="大学英语" data-examid="88" data-courseid="99">' \
+              '<td>1</td><td>口语考试</td><td>2026-11-28 09:00 至 2026-11-28 10:00</td>' \
+              '<td>60</td><td>未开始</td><td>未作答</td></tr>'
+        context = Context({"/exam-ans/exam/test/examcode/examlist": Response(row)})
+        result = collect_chaoxing(context, homework_courses=[], exam_courses=None)
+        self.assertEqual([(item["course"], item["source_key"]) for item in result["candidates"]],
+                         [("大学英语", "course:99:exam:88")])
+        self.assertTrue(result["diagnostics"]["coverage"]["all_exam_courses"])
+        self.assertTrue(result["diagnostics"]["coverage"]["complete"])
+        self.assertFalse(any("courselistdata" in url for url, _ in context.request.calls))
+
+    def test_all_courses_known_empty_directory_completes_but_unknown_page_does_not(self):
+        for page, expected in (("<p>暂无课程</p>", True), ("<main>changed layout</main>", False)):
+            with self.subTest(page=page):
+                result = collect_chaoxing(CourseDirectoryContext({"1": page}), homework_courses=None, exam_courses=[])
+                self.assertEqual(result["diagnostics"]["coverage"]["complete"], expected)
+                self.assertEqual(result["candidates"], [])
+
+    def test_all_courses_plain_year_cannot_establish_a_new_binding(self):
+        context = CourseDirectoryContext({"1": course_card("11", "概率论")}, dates="作答时间:11-21 12:15 至 11-28 09:50")
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[], homework_year=2026)
+        self.assertEqual(result["candidates"], [])
+        self.assertIsNone(result["diagnostics"]["homework_year_binding"])
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+
+    def test_all_courses_saved_year_binding_applies_only_to_exact_course_and_class(self):
+        cards = course_card("11", "概率论") + course_card("12", "大学英语")
+        binding = {"year": 2026, "courseid": "11", "clazzid": "22"}
+        context = CourseDirectoryContext({"1": cards}, dates="作答时间:11-21 12:15 至 11-28 09:50")
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[], homework_year=binding)
+        self.assertEqual([item["course"] for item in result["candidates"]], ["概率论"])
+        self.assertEqual(result["candidates"][0]["due_at"], "2026-11-28T09:50:00+08:00")
+        self.assertEqual(result["diagnostics"]["homework_year_binding"], binding)
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+        self.assertEqual(len(result["status_updates"]), 2)
+        wrong_class = collect_chaoxing(context, homework_courses=None, exam_courses=[],
+                                       homework_year={**binding, "clazzid": "23"})
+        self.assertEqual(wrong_class["candidates"], [])
+        self.assertIsNone(wrong_class["diagnostics"]["homework_year_binding"])
+
+    def test_all_courses_follows_only_offered_course_directory_pages(self):
+        first = course_card("11", "概率论") + '<a href="/mooc2-ans/visit/courselistdata?pageNum=2">下一页</a>'
+        context = CourseDirectoryContext({"1": first, "2": course_card("12", "大学英语")})
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        self.assertEqual({item["course"] for item in result["candidates"]}, {"概率论", "大学英语"})
+        self.assertEqual(result["diagnostics"]["coverage"]["course_lists_read"], 2)
+        self.assertTrue(result["diagnostics"]["coverage"]["complete"])
+        page_queries = [parse_qs(urlparse(url).query) for url, _ in context.request.calls if "courselistdata" in url]
+        self.assertEqual(page_queries[1]["pageNum"], ["2"])
+        self.assertEqual(page_queries[1]["courseFid"], ["456"])
+
+    def test_failed_second_directory_page_keeps_first_page_work_and_partial_coverage(self):
+        first = course_card("11", "概率论") + '<a href="?pageNum=2">下一页</a>'
+        context = CourseDirectoryContext({"1": first, "2": RuntimeError("synthetic timeout")})
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        self.assertEqual([item["course"] for item in result["candidates"]], ["概率论"])
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+        self.assertTrue(any("分页读取未完成" in value for value in result["warnings"]))
+
+    def test_course_directory_page_limit_retains_discovered_courses_and_reports_partial(self):
+        pages = {str(index): course_card(str(index + 10), "课程" + str(index))
+                 + ('<a href="?pageNum=' + str(index + 1) + '">下一页</a>' if index < 11 else '')
+                 for index in range(1, 12)}
+        context = CourseDirectoryContext(pages)
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        self.assertEqual(result["diagnostics"]["coverage"]["course_lists_read"], 10)
+        self.assertEqual(len(result["candidates"]), 10)
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+        self.assertTrue(any("10 页" in value for value in result["warnings"]))
+
+    def test_unrecognized_or_wrong_school_next_control_does_not_claim_full_coverage(self):
+        for control in ('<button onclick="loadMore()">加载更多</button>',
+                        '<a href="?courseFid=999&amp;pageNum=2">下一页</a>'):
+            with self.subTest(control=control):
+                context = CourseDirectoryContext({"1": course_card("11", "概率论") + control})
+                result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+                self.assertEqual(len(result["candidates"]), 1)
+                self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+                self.assertFalse(any("pageNum" in url for url, _ in context.request.calls))
+
+    def test_other_course_failure_keeps_verified_work_and_marks_all_scan_partial(self):
+        context = CourseDirectoryContext({"1": course_card("11", "概率论") + course_card("12", "大学英语")}, failed_course="12")
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        self.assertEqual([item["course"] for item in result["candidates"]], ["概率论"])
+        self.assertEqual(result["diagnostics"]["coverage"]["courses_attempted"], 2)
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
 
     def test_homework_only_scope_skips_exam_request_and_still_completes(self):
         context = Context({"/exam-ans/exam/test/examcode/examlist": RuntimeError("must not request")})
@@ -703,6 +838,44 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "请求数上限"):
             reader.get("https://i.chaoxing.com/base")
         self.assertEqual(reader.context.request.calls, [])
+
+    def test_expanded_all_course_reader_budget_still_stops_at_its_limit(self):
+        reader = _Reader(Context(), budget=90, max_requests=200)
+        reader.count = 100
+        reader.get("https://i.chaoxing.com/base")
+        self.assertEqual(reader.count, 101)
+        reader.count = 200
+        with self.assertRaisesRegex(Exception, "请求数上限"):
+            reader.get("https://i.chaoxing.com/base")
+        self.assertEqual(len(reader.context.request.calls), 1)
+        self.assertEqual(reader.diagnostics()["budget_seconds"], 90)
+
+    def test_all_course_budget_covers_34_courses_with_normal_course_redirects(self):
+        cards = ''.join(course_card(str(index), "课程" + str(index)) for index in range(1, 35))
+        context = CourseDirectoryContext({"1": cards})
+        original_get = context.request.get
+
+        def with_course_redirect(url, **kwargs):
+            path = urlparse(url).path
+            if path in {"/visit/stucoursemiddle", "/mooc2-ans/mycourse/stu"}:
+                context.request.calls.append((url, kwargs))
+                if path == "/visit/stucoursemiddle":
+                    return Response(status=302, headers={"location": "https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/stu"})
+                return Response('<input id="workEnc" value="synthetic-access">')
+            return original_get(url, **kwargs)
+
+        context.request.get = with_course_redirect
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        diagnostic = result["diagnostics"]
+        self.assertEqual(diagnostic["coverage"]["courses_found"], 34)
+        self.assertEqual(diagnostic["coverage"]["courses_attempted"], 34)
+        self.assertEqual(diagnostic["coverage"]["work_lists_read"], 34)
+        self.assertEqual(len(result["candidates"]), 34)
+        self.assertTrue(diagnostic["coverage"]["complete"])
+        self.assertGreater(diagnostic["requests"], 100)
+        self.assertLessEqual(diagnostic["requests"], 200)
+        self.assertEqual(diagnostic["request_limit"], 200)
+        self.assertEqual(diagnostic["budget_seconds"], 90)
 
     def test_missing_target_exam_id_returns_only_redacted_local_structure(self):
         table = '<table><tr class="dataTr" id="exam_row_123"><td>1</td><td>大物单元测验 PRIVATE_NAME</td>' \
