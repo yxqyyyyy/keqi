@@ -18,7 +18,7 @@ DEFAULT_SETTINGS = {
     "physics": {"enabled": False, "time": "24:00", "until": None},
     "calendar": {"name": "作业与考试", "identifier": None, "auto_sync": False},
     "collection": {"auto_scan": False, "interval_minutes": 1440, "homework_year": None,
-                   "all_course_types": [],
+                   "all_course_types": [], "homework_year_bindings": [],
                    "course_scope": {"chaoxing_homework": [], "chaoxing_exams": [], "xiji": []}},
     "daily": {"enabled": True, "time": "08:00"},
 }
@@ -27,6 +27,28 @@ LEGACY_COURSE_SCOPE = {"chaoxing_homework": ["概率论"], "chaoxing_exams": ["�
 SOURCES = {"chaoxing", "xiji", "manual", "physics"}
 KINDS = {"assignment", "exam", "lecture"}
 EDITABLE_TASK_FIELDS = {"title", "course", "kind", "start_at", "due_at", "status", "url", "notes"}
+
+
+def valid_homework_year_binding(value):
+    """A confirmed year belongs to one proven course and class, never a keyword."""
+    return (isinstance(value, dict) and type(value.get("year")) is int
+            and 2000 <= value["year"] < 2100
+            and all(isinstance(value.get(key), str) and re.fullmatch(r"\d{1,30}", value[key])
+                    for key in ("courseid", "clazzid")))
+
+
+def homework_year_bindings(collection):
+    """Merge the historical single-course binding with explicit per-course ones."""
+    values = [collection.get("homework_year_binding")]
+    multiple = collection.get("homework_year_bindings", [])
+    if isinstance(multiple, list):
+        values.extend(multiple)
+    bindings = {}
+    for value in values:
+        if valid_homework_year_binding(value):
+            bindings[(value["courseid"], value["clazzid"])] = {
+                key: value[key] for key in ("year", "courseid", "clazzid")}
+    return [bindings[key] for key in sorted(bindings)]
 
 
 class TaskConflictError(ValueError):
@@ -335,6 +357,15 @@ class Store:
                 if year is not None and (type(year) is not int or not 2000 <= year <= 2100):
                     raise ValueError("作业年份应为 2000–2100 的整数，或留空")
                 result["collection"]["homework_year"] = year
+            if "homework_year_bindings" in cfg:
+                values = cfg["homework_year_bindings"]
+                if (not isinstance(values, list) or len(values) > 500
+                        or any(not valid_homework_year_binding(value) for value in values)
+                        or len({(value["courseid"], value["clazzid"]) for value in values}) != len(values)):
+                    raise ValueError("课程年份应为不重复的课程、班级和 2000–2099 年份记录")
+                result["collection"]["homework_year_bindings"] = [
+                    {key: value[key] for key in ("year", "courseid", "clazzid")}
+                    for value in values]
             if any(result["collection"].get(k) != previous_collection.get(k) for k in ("course_scope", "homework_year")):
                 result["collection"]["homework_year_binding"] = None
         if "daily" in patch:
@@ -345,7 +376,7 @@ class Store:
                 raise ValueError("每日同步开关格式不正确")
             result["daily"]["time"] = validate_daily_time(result["daily"]["time"])
         result = self.patch_settings({k: result[k] for k in ("physics", "collection", "daily") if k in patch}, reset_future_physics="physics" in patch)
-        if any(result["collection"].get(k) != previous_collection.get(k) for k in ("course_scope", "homework_year", "all_course_types")):
+        if any(result["collection"].get(k) != previous_collection.get(k) for k in ("course_scope", "homework_year", "all_course_types", "homework_year_bindings")):
             self.set_value("daily_last_success", None)
         self.ensure_physics()
         return result

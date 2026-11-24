@@ -185,6 +185,22 @@ class SyncMetadataTests(unittest.TestCase):
         self.assertTrue(info["sources"]["chaoxing"]["scope_changed"])
         self.assertFalse(info["sources"]["xiji"]["scope_changed"])
 
+    def test_multiple_year_binding_change_invalidates_only_chaoxing_and_signature_is_order_independent(self):
+        self.scan()
+        values = [{'year': 2026, 'courseid': '11', 'clazzid': '22'},
+                  {'year': 2025, 'courseid': '33', 'clazzid': '44'}]
+        self.app.store.update_settings({'collection': {'homework_year_bindings': values}})
+        collection = self.app.store.settings()['collection']
+        info = self.app.sync_metadata()
+        self.assertTrue(info['scope_changed'])
+        self.assertTrue(info['sources']['chaoxing']['scope_changed'])
+        self.assertFalse(info['sources']['xiji']['scope_changed'])
+        changed = {**collection, 'homework_year_bindings': list(reversed(values))}
+        self.assertEqual(sync_signature(collection), sync_signature(changed))
+        changed['homework_year_bindings'][0] = {**changed['homework_year_bindings'][0], 'year': 2027}
+        self.assertNotEqual(sync_signature(collection, 'chaoxing'), sync_signature(changed, 'chaoxing'))
+        self.assertEqual(sync_signature(collection, 'xiji'), sync_signature(changed, 'xiji'))
+
     def test_scope_changed_during_read_does_not_record_success(self):
         def request(*args):
             self.app.store.patch_settings({"collection": {"course_scope": {"chaoxing_homework": ["概率论"], "chaoxing_exams": [], "xiji": ["新课程"]}}})

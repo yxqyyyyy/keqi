@@ -21,6 +21,7 @@ let editingTaskRevision = null;
 let lastCollectionScan = null;
 let refreshVersion = 0;
 const pendingPlatformActions = new Map();
+const pendingYearConfirmations = new Set();
 
 function escapeHTML(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -261,21 +262,22 @@ function syncFilterControls() {
   $('#searchInput').value = filters.search;
 }
 function renderPlatforms() {
+  renderUnresolvedHomework();
   const error = state.collection?.last_error?.message;
   $('#collectionError').hidden = !error;
   $('#collectionError').textContent = error ? `最近同步未完成：${error}` : '';
   const daily = state.settings?.daily || {};
   const pending = state.collection?.pending_count || 0;
   const retry = state.collection?.automatic_retry || {};
-  const paused = Object.keys(retry.blocked_sources || {}).map(sourceName);
-  const retryText = paused.length ? ` ${paused.join('、')}登录已失效，自动读取已暂停；本人登录后点击检查即可恢复。` : retry.daily?.attempts >= 3 ? ' 今日自动读取已达 3 次上限，可手动同步。' : '';
+  const paused = Object.entries(retry.blocked_sources || {});
+  const retryText = paused.length ? paused.map(([source, info]) => info?.reason === 'verification_required' ? ` ${sourceName(source)}平台要求验证码，自动读取已暂停，请本人在平台完成验证后检查状态。` : info?.reason === 'not_authenticated' ? ` ${sourceName(source)}登录已失效，自动读取已暂停；本人登录后点击检查即可恢复。` : ` ${sourceName(source)}自动读取已暂停，请检查平台状态。`).join('') : retry.daily?.attempts >= 3 ? ' 今日自动读取已达 3 次上限，可手动同步。' : '';
   $('#collectionModeMessage').textContent = `${daily.enabled ? `每天 ${daily.time || '08:00'} 自动同步（北京时间），提醒前额外核对提交状态。` : '每日自动同步已关闭，可点击立即同步。'}${pending ? ` 当前有 ${pending} 项需核对的安排。` : ''}${state.collection?.completed_count ? ` 已识别 ${state.collection.completed_count} 项已提交记录，不设置提醒。` : ''}${retryText} Mac 需运行并联网。`;
   $('#platformList').innerHTML = ['chaoxing', 'xiji'].map(source => {
     const platform = state.platforms?.[source] || {};
     const authenticated = platform.status === 'authenticated';
-    const statuses = { disabled: '未选择课程', authenticated: '已确认登录', session_saved: '会话已保存 · 待检查', session_detected: '已识别登录页面 · 待验证课程', browser_open: '登录窗口已打开 · 待检查', browser_opened: '登录窗口已打开 · 待检查', not_authenticated: '登录已失效', unverified: '页面暂未识别 · 待检查', error: '验证未完成', not_connected: '尚未接入' };
+    const statuses = { disabled: '未选择课程', authenticated: '已确认登录', session_saved: '会话已保存 · 待检查', session_detected: '已识别登录页面 · 待验证课程', browser_open: '登录窗口已打开 · 待检查', browser_opened: '登录窗口已打开 · 待检查', not_authenticated: '登录已失效', verification_required: '需要本人完成平台验证', unverified: '页面暂未识别 · 待检查', error: '验证未完成', not_connected: '尚未接入' };
     const status = statuses[platform.status] || '登录状态待确认';
-    const description = platform.message || '请在 Mac 上打开平台登录页，由你本人输入账号、密码和验证码。';
+    const description = platform.message || (platform.status === 'verification_required' ? '平台要求本人完成验证码或安全验证。请在平台完成验证后点击检查登录状态。' : '请在 Mac 上打开平台登录页，由你本人输入账号、密码和验证码。');
     const sync = state.collection?.sync?.sources?.[source] || {};
     const syncDetail = `最近成功读取：${syncTime(sync.last_success_at)}${sync.scope_changed && sync.last_success_at ? '（旧课程范围）' : ''}`;
     const attemptDetail = `最近尝试：${syncTime(sync.last_attempt_at)} · ${syncResultLabel(sync.scope_changed ? 'scope_changed' : sync.last_result)}`;
@@ -284,6 +286,62 @@ function renderPlatforms() {
     const hint = platform.status === 'error' ? '<p class="fine-print">本次网页读取未完成，尚不能判断会话是否有效。请先确认平台网页能正常加载，再检查登录状态。</p>' : '';
     return `<article class="platform-card"><div class="platform-top"><span class="platform-mark" aria-hidden="true">${source === 'chaoxing' ? '学' : '希'}</span><div><h3>${sourceName(source)}</h3><p>${source === 'chaoxing' ? '作业 · 考试' : '武汉大学 · 在线作业'}</p></div></div><span class="status-pill${authenticated ? '' : ' waiting'}">${status}</span><p>${escapeHTML(description)}</p>${hint}<div class="platform-sync-detail"><p>${escapeHTML(syncDetail)}</p><p>${escapeHTML(attemptDetail)}</p></div><div class="platform-actions"><button class="button secondary" data-check-login="${source}"${disabled}>${pending === 'probe' ? '正在检查…' : '检查登录状态'}</button><button class="button secondary" data-connect="${source}"${disabled}>${pending === 'open' ? '正在打开窗口…' : '打开登录窗口 ↗'}</button><button class="button secondary" data-finish-login="${source}"${disabled}>${pending === 'finish' ? '正在确认登录…' : '完成登录并关闭专用窗口'}</button></div></article>`;
   }).join('');
+}
+function unresolvedHomework() {
+  return Array.isArray(state.collection?.unresolved_homework) ? state.collection.unresolved_homework.filter(item => item && item.status !== 'completed') : [];
+}
+function renderUnresolvedHomework() {
+  const items = unresolvedHomework();
+  $('#unresolvedNudge').hidden = !items.length;
+  $('#unresolvedSummary').textContent = `${items.length} 项平台作业的时间待核对，尚未设置准确提醒。`;
+  $('#unresolvedArea').hidden = !items.length;
+  $('#unresolvedCount').textContent = `${items.length} 项`;
+  const list = $('#unresolvedList');
+  if (!items.length) { list.innerHTML = ''; return; }
+  // A background refresh must preserve an in-progress year edit and its button.
+  if (pendingYearConfirmations.size || (typeof document !== 'undefined' && list.contains(document.activeElement))) return;
+  const reasons = { missing_year: '平台时间缺少年份', missing_id: '平台未提供可核实的作业编号', missing_detail_link: '暂未识别到可读取的作业详情链接', unknown_deadline_or_conflict: '截止时间尚未确认，或页面时间存在冲突', identity_mismatch: '作业详情的课程或班级与列表不一致，需核对来源', read_failed: '本次作业详情读取未完成，需稍后重试', read_limit: '本次读取达到上限，这项作业尚未核对完成', status_conflict: '同一作业的提交状态互相冲突，需本人核对', time_conflict: '同一作业的时间互相冲突，需本人核对', not_rechecked: '本次尚未重新核对，保留上次发现记录' };
+  const year = beijingDay().slice(0, 4);
+  const readAt = state.collection?.unresolved_homework_read_at;
+  list.innerHTML = `<p class="fine-print">待核对列表最近更新：${escapeHTML(readAt ? syncTime(readAt) : '尚无记录')}（北京时间）</p>` + items.map((item, index) => `<article class="candidate-card unresolved-card">
+    <p class="unresolved-course">${escapeHTML(item.course || '学习通课程')}</p><h3>${escapeHTML(item.title || '待核对作业')}</h3>
+    <p class="unresolved-time">平台时间：${escapeHTML(item.time_text || '未提供明确时间')}</p><p class="muted">${escapeHTML(reasons[item.reason] || '平台信息待核对')}</p>
+    ${item.reason === 'missing_year' && item.year_confirmation_available && item.source_key ? `<form class="confirm-year-form" data-courseid="${escapeHTML(item.courseid)}" data-clazzid="${escapeHTML(item.clazzid)}">
+      <label for="unresolvedYear${index}">确认这门课的作业开始年份<input id="unresolvedYear${index}" name="year" type="number" min="2000" max="2099" step="1" value="${year}" required></label>
+      <button class="button secondary" type="submit">确认年份并加入安排</button><p class="fine-print">请先核对平台日期。确认仅用于这门课和班级，后续同步可重复使用；提交状态会在下次后台读取时核对。</p><p class="form-error" role="alert"></p></form>` : '<p class="fine-print">请在平台核对后手动添加准确安排；这项作业仍会继续检查。</p>'}
+  </article>`).join('');
+}
+async function confirmHomeworkYear(form) {
+  const { courseid, clazzid } = form.dataset;
+  const key = `${courseid}:${clazzid}`;
+  if (pendingYearConfirmations.has(key)) return;
+  const errorBox = $('.form-error', form);
+  errorBox.textContent = '';
+  const raw = $('input[name="year"]', form).value.trim();
+  const year = Number(raw);
+  if (!/^\d{4}$/.test(raw) || !Number.isInteger(year) || year < 2000 || year >= 2100) {
+    errorBox.textContent = '请填写 2000 至 2099 之间的年份。';
+    return;
+  }
+  const known = unresolvedHomework().some(item => item.courseid === courseid && item.clazzid === clazzid && item.reason === 'missing_year' && item.year_confirmation_available && item.source_key);
+  if (!known) { errorBox.textContent = '这项待核对记录已变化，请刷新后重新核对。'; return; }
+  if ($('#scanButton').disabled) { errorBox.textContent = '正在同步课程，请等本次读取完成后再确认年份。'; return; }
+  pendingYearConfirmations.add(key);
+  let saved = false;
+  try {
+    await busy($('button[type="submit"]', form), '正在确认…', async () => {
+      const result = await api('/api/collection/confirm-year', { method: 'POST', body: JSON.stringify({ courseid, clazzid, year }) });
+      saved = true;
+      if (result.needs_scan === true) {
+        toast(result.message || '课程年份已确认，正在重新读取并加入安排。');
+        await syncCollection($('#scanButton'));
+      } else {
+        await refresh({ silent: true });
+        toast(result.message || '课程年份已确认，安排已更新。提交状态会在下次后台读取时核对。');
+      }
+    });
+  } catch (error) { errorBox.textContent = error.message; }
+  finally { pendingYearConfirmations.delete(key); if (saved) renderUnresolvedHomework(); }
 }
 function renderSettings() {
   const collection = state.settings?.collection || {};
@@ -565,8 +623,9 @@ $('#physicsForm').addEventListener('submit', async event => {
     } catch (error) { $('#physicsError').textContent = error.message; }
   });
 });
-$('#scanButton').addEventListener('click', async event => {
-  await busy(event.currentTarget, '正在同步…', async () => {
+async function syncCollection(button) {
+  if (button.disabled) { toast('正在同步课程，请等本次读取完成。'); return; }
+  await busy(button, '正在同步…', async () => {
     $('#collectionMessage').textContent = '正在核对所选课程的作业、考试和提交状态…';
     try {
       const result = await api('/api/collection/scan', { method: 'POST', body: '{}' });
@@ -579,6 +638,13 @@ $('#scanButton').addEventListener('click', async event => {
       await refresh({ silent: true });
     } catch (error) { $('#collectionMessage').textContent = error.message; }
   });
+}
+$('#scanButton').addEventListener('click', async event => { await syncCollection(event.currentTarget); });
+$('#unresolvedList').addEventListener('submit', async event => {
+  const form = event.target.closest('.confirm-year-form');
+  if (!form) return;
+  event.preventDefault();
+  await confirmHomeworkYear(form);
 });
 $('#dailyForm').addEventListener('submit', async event => {
   event.preventDefault();

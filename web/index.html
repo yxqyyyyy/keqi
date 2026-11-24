@@ -32,6 +32,7 @@
       <section id="agendaView" class="view active" aria-labelledby="agendaHeading">
         <div class="page-intro"><p class="eyebrow">每个截止，都有着落</p><h1 id="agendaHeading">近期安排</h1><p class="intro-copy" id="agendaSummary">正在读取你的安排…</p></div>
         <section class="sync-overview" aria-label="数据同步时间"><div class="sync-overview-heading"><span>数据同步 · 北京时间</span><strong id="syncResult">正在读取状态…</strong></div><p id="platformSyncTime">平台最近完整同步：尚无记录</p><p class="sync-source-times" id="sourceSyncTimes"></p><p class="sync-attempt" id="syncAttemptTime"></p><p class="sync-calendar-time" id="calendarSyncTime"></p></section>
+        <div class="account-nudge unresolved-nudge" id="unresolvedNudge" hidden><p id="unresolvedSummary"></p><button class="button secondary" data-view="connections">核对作业时间 →</button></div>
         <div class="account-nudge" id="accountNudge" hidden><div><strong>连接你的课程平台</strong><p>登录学习通与希冀，把课程里的截止时间汇到这里。</p></div><button class="button secondary" data-view="connections">前往登录 <span aria-hidden="true">↗</span></button></div>
         <div class="overview" aria-label="近期任务概览">
           <div><span class="metric-label">48 小时内</span><strong id="soonCount">0<small>项待办</small></strong></div>
@@ -51,6 +52,7 @@
         <div class="page-intro"><p class="eyebrow">把安排汇到一处</p><h1 id="connectionsHeading">登录你的课程平台</h1><p class="intro-copy">首次打开专用窗口并本人登录，再点击“完成登录并关闭专用窗口”，即可保存会话供后台同步。会话有效期间无需每天登录或打开窗口。两个平台同时打开时请先完成各自登录；希冀窗口打开期间暂停切课读取。</p></div>
         <p class="collection-mode-message" id="collectionModeMessage"></p><div class="platform-list" id="platformList"></div>
         <div class="collection-panel"><div><h2>同步课程安排</h2><p>每日自动读取作业、考试和提交状态。新安排自动加入，已提交自动完成并取消后续提醒。</p><p id="courseScopeSummary"></p><button class="text-button" data-view="settings">设置我的课程 →</button></div><button class="button primary" id="scanButton">立即同步</button><p class="inline-message" id="collectionMessage" role="status"></p><p class="form-error" id="collectionError" role="status" hidden></p></div>
+        <section class="unresolved-area" id="unresolvedArea" aria-labelledby="unresolvedHeading" hidden><div class="section-heading"><h2 id="unresolvedHeading">作业时间待核对</h2><span class="status-pill waiting" id="unresolvedCount"></span></div><p class="muted">这些作业已在平台发现，但尚未确认准确截止时间，暂时无法设置日历提醒。请逐项核对，避免漏记。</p><div id="unresolvedList"></div></section>
         <div class="candidate-area" id="candidateArea" hidden><div class="section-heading"><h2>确认要加入的安排</h2><label class="checkbox-label"><input type="checkbox" id="selectAllCandidates" checked> 全选</label></div><p class="muted">只有勾选并确认的项目才会保存。没有识别出时间的项目，请先补全。</p><div id="candidateWarnings" class="warning-box" hidden></div><div id="candidateList"></div><button class="button primary" id="importCandidatesButton">确认加入选中安排</button></div>
         <div class="help-block"><h2>按自己的课程读取</h2><p>在设置中勾选“全部课程”，可检查偶尔布置作业的课程。也可取消勾选，填写指定课程关键词；取消勾选并留空会关闭该类读取。每周大物线下作业按需启用，提交后手动勾选完成。</p><p>每天一次完整同步，在提前 48/24/2 小时提醒前额外核对提交状态，2 小时提醒前再做一次临近复查。Mac 需运行并联网；睡眠错过当天时间，恢复运行后补读。</p><p>已提交的记录不进入待提醒列表。只有未完成作业标为逾期；已开课的课程和已结束的考试可在“全部”中查看。登录信息保存在本机专用浏览器中。</p></div>
       </section>

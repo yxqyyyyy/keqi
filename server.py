@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import hmac
 import json
 import mimetypes
@@ -20,7 +21,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from studyreminder.calendar_sync import CalendarSync
 from studyreminder.collector import BrowserCollector
-from studyreminder.core import Store, TaskConflictError, TZ, now_iso, to_ics
+from studyreminder.core import Store, TaskConflictError, TZ, homework_year_bindings, now_iso, to_ics, valid_homework_year_binding
 from studyreminder.cloud_sync import CloudSync
 from studyreminder.scheduling import daily_due, reminder_recheck_keys
 from studyreminder.sync_status import platform_synced_at, sync_info, sync_signature
@@ -67,9 +68,13 @@ class Application:
         tasks = self.store.tasks()
         confirmed = {(t["source"], t.get("source_key")) for t in tasks if t.get("source_key")}
         pending = [t for t in self.collector.last_candidates if t["status"] != "completed" and (t["source"], t.get("source_key")) not in confirmed]
+        previous_result = self.store.get_value("last_collection_result", {})
+        unresolved = previous_result.get("unresolved_homework", []) if isinstance(previous_result, dict) else []
         return {"tasks": tasks, "settings": self.store.settings(), "cloud_sync": self.cloud.info(),
                 "platforms": self.collector.status, "calendar_sync": self.calendar.info(),
                 "collection": {"pending_count": len(pending), "candidates": pending,
+                               "unresolved_homework": unresolved,
+                               "unresolved_homework_read_at": previous_result.get("unresolved_homework_verification", {}).get("read_at") if isinstance(previous_result, dict) else None,
                                "completed_count": sum(t["status"] == "completed" for t in self.collector.last_candidates),
                                "warnings": [re.sub(r"（[A-Za-z0-9.-]+/[^）]*）", "", v) for v in self.collector.last_warnings],
                                "mode": "daily_sync", "last_scan": self.store.get_value("last_collection_scan"),
@@ -265,7 +270,7 @@ class Application:
         return next_at.tzinfo is not None and now >= next_at
 
     def refresh_auth_retry(self, source, auth_status=None, explicit=False, expected_generation=None):
-        """Only genuine login failure pauses a platform; a user login can resume it."""
+        """Pause login failures and verification challenges until user repair."""
         if source not in PLATFORM_SOURCES:
             raise ValueError("请选择学习通或希冀平台")
         with self.retry_lock:
@@ -277,9 +282,10 @@ class Application:
             if explicit:
                 generations[source] = generations.get(source, 0) + 1
             blocked = state["blocked_sources"]
-            if auth_status == "not_authenticated":
-                blocked[source] = {"at": now_iso(), "reason": "not_authenticated"}
-            elif explicit or auth_status == "authenticated":
+            if auth_status in {"not_authenticated", "verification_required"}:
+                blocked[source] = {"at": now_iso(), "reason": auth_status}
+            elif explicit or (auth_status == "authenticated" and
+                              blocked.get(source, {}).get("reason") != "verification_required"):
                 blocked.pop(source, None)
                 # An explicit repair is allowed to retry immediately. Normal
                 # successful reads do not reset a failing daily attempt budget.
@@ -305,7 +311,8 @@ class Application:
         task_sources = {t["id"]: t.get("source") for t in tasks}
         with self.retry_lock:
             state = self.retry_state(now, cfg["time"])
-            signature = (sync_signature(collection_cfg) if collection_cfg.get("all_course_types") else
+            signature = (sync_signature(collection_cfg) if (collection_cfg.get("all_course_types")
+                                                          or homework_year_bindings(collection_cfg)) else
                          json.dumps(scope, sort_keys=True, ensure_ascii=True))
             if state["daily"].get("scope") != signature:
                 state["daily"].update(scope=signature, attempts=0, completed_sources=[], next_attempt_at=None)
@@ -389,14 +396,95 @@ class Application:
             self.calendar.sync_if_enabled()
         return result
 
+    def confirm_homework_year(self, raw):
+        """Use confirmed years with saved read-only metadata, without rereading."""
+        if not isinstance(raw, dict):
+            raise ValueError("请填写课程、班级和年份")
+        binding = {key: raw.get(key) for key in ("year", "courseid", "clazzid")}
+        if not valid_homework_year_binding(binding):
+            raise ValueError("请填写有效课程、班级和 2000–2099 的整数年份")
+        with self.retry_lock:
+            result = self.store.get_value("last_collection_result", {})
+            unresolved = result.get("unresolved_homework", []) if isinstance(result, dict) else []
+            proof = result.get("unresolved_homework_verification", {}) if isinstance(result, dict) else {}
+            generation = self.store.get_value("collection_retry", {}).get("auth_generations", {}).get("chaoxing", 0)
+            if proof.get("auth_status") != "authenticated" or proof.get("auth_generation") != generation:
+                raise ValueError("待核对作业的登录会话尚未验证，请先重新读取学习通")
+            matched = [item for item in unresolved if isinstance(item, dict)
+                       and all(item.get(key) == binding[key] for key in ("courseid", "clazzid"))
+                       and item.get("reason") == "missing_year"
+                       and item.get("year_confirmation_available") is True
+                       and isinstance(item.get("source_key"), str)
+                       and re.fullmatch(r"course:" + re.escape(binding["courseid"]) + r":class:"
+                                        + re.escape(binding["clazzid"]) + r":work:\d+", item["source_key"])]
+            if not matched:
+                raise ValueError("未找到可确认年份的当前作业，请先重新读取学习通")
+            from studyreminder.chaoxing_adapter import _Tree, _confirmed_work_dates
+            imports = []
+            for item in matched:
+                due, start, original = _confirmed_work_dates(
+                    _Tree("<p>" + html.escape(item.get("time_text", "")) + "</p>").root, binding["year"])
+                if not due:
+                    raise ValueError("此年份与平台作答日期不匹配，请核对年份和日期")
+                notes = ("学习通只读采集的作业时间。\n平台原文：" + original
+                         + "\n时间读取于：" + proof.get("read_at", "未知")
+                         + "\n年份依据：用户确认 " + str(binding["year"]) + " 年；仅用于课程 ID "
+                         + binding["courseid"] + "、班级 ID " + binding["clazzid"]
+                         + "\n年份确认于：" + now_iso()
+                         + ("\n读取时平台状态：未提交" if item.get("status") == "pending" else
+                            "\n平台提交状态未能可靠确认，请本人核对"))
+                imports.append({"title": item.get("title", ""), "course": item.get("course", ""),
+                                "source": "chaoxing", "source_key": item["source_key"], "kind": "assignment",
+                                "start_at": start, "due_at": due, "status": "pending",
+                                "url": "https://i.chaoxing.com/", "notes": notes})
+            cfg = self.store.settings()["collection"]
+            values = { (item["courseid"], item["clazzid"]): item
+                       for item in homework_year_bindings(cfg) }
+            values[(binding["courseid"], binding["clazzid"])] = binding
+            self.store.patch_settings({"collection": {"homework_year_bindings": [values[key] for key in sorted(values)]}})
+            imported = self.store.import_tasks(imports)
+            resolved = {item["source_key"] for item in imports}
+            self.store.set_value("last_collection_result", {**result, "unresolved_homework": [
+                item for item in unresolved if not isinstance(item, dict) or item.get("source_key") not in resolved]})
+            self.store.set_value("daily_last_success", None)
+        self.cloud.wake.set()
+        self.calendar.sync_if_enabled()
+        return {"ok": True, "binding": binding, "needs_scan": False, "imported": len(imported),
+                "message": "已按确认年份加入安排，并保存此课程和班级的年份供后续读取使用。"}
+
+    @staticmethod
+    def merge_unresolved_homework(previous, incoming, resolved_keys):
+        """Retain unread work without treating older dates as newly verified."""
+        def identity(item):
+            key = item.get("source_key")
+            if isinstance(key, str) and re.fullmatch(r"course:\d+:class:\d+:work:\d+", key):
+                return ("key", key)
+            return ("unidentified", *(item.get(field, "") for field in
+                    ("courseid", "clazzid", "title", "time_text")))
+
+        merged = {}
+        for item in previous:
+            if not isinstance(item, dict) or item.get("source_key") in resolved_keys:
+                continue
+            merged[identity(item)] = {**item, "reason": "not_rechecked", "year_confirmation_available": False}
+        for item in incoming:
+            if isinstance(item, dict):
+                merged[identity(item)] = item
+        return list(merged.values())
+
     def _scan(self, update_existing=False, import_new=False, sources=None, auth_generations=None):
         self.last_scan = time.monotonic()
         self.store.set_value("daily_last_attempt", now_iso())
         cfg = self.store.settings()["collection"]
-        year = cfg.get("homework_year_binding") or cfg.get("homework_year")
-        confirmed_year = year.get("year") if isinstance(year, dict) else year
-        if confirmed_year != datetime.now(TZ).year:
-            year = None
+        bindings = homework_year_bindings(cfg)
+        # Explicit course/class bindings remain separate from the historical
+        # single-keyword confirmation and are never spread to other courses.
+        if bindings:
+            year = bindings if cfg.get("homework_year_bindings") else bindings[0]
+        else:
+            year = cfg.get("homework_year")
+            if year != datetime.now(TZ).year:
+                year = None
         scope = dict(cfg["course_scope"])
         all_course_types = list(cfg.get("all_course_types", []))
         omitted = PLATFORM_SOURCES - sources if sources is not None else set()
@@ -425,6 +513,8 @@ class Application:
                 result["status_updates"] = [item for item in result.get("status_updates", []) if item.get("source") not in stale]
                 if "chaoxing" in stale:
                     result.pop("homework_year_binding", None)
+                    result.pop("homework_year_bindings", None)
+                    result.pop("unresolved_homework", None)
         with self.retry_lock:
             discard_replaced_sessions()
         for source, outcome in result.get("source_results", {}).items():
@@ -432,7 +522,7 @@ class Application:
                 self.refresh_auth_retry(source, outcome.get("auth_status"),
                                         expected_generation=auth_generations.get(source))
         current = self.store.settings()["collection"]
-        if any(current.get(k) != cfg.get(k) for k in ("course_scope", "homework_year", "all_course_types")):
+        if any(current.get(k) != cfg.get(k) for k in ("course_scope", "homework_year", "all_course_types", "homework_year_binding", "homework_year_bindings")):
             raise ValueError("读取期间课程设置已改变，请按新范围重新同步")
         if result.get("homework_year_binding"):
             self.store.patch_settings({"collection": {"homework_year_binding": result["homework_year_binding"]}})
@@ -479,6 +569,34 @@ class Application:
                     "at": now_iso(), "message": "本次未能完整读取所选课程；已确认的提交状态仍已更新。"
                     + ("有平台登录已失效，请在对应平台重新登录。" if login_required else
                        "程序会继续使用保存的会话有限重试，具体原因见平台检查结果。")})
+        previous_result = self.store.get_value("last_collection_result", {})
+        previous_result = previous_result if isinstance(previous_result, dict) else {}
+        proof = previous_result.get("unresolved_homework_verification", {})
+        generation = self.store.get_value("collection_retry", {}).get("auth_generations", {}).get("chaoxing", 0)
+        cx_outcome = result.get("source_results", {}).get("chaoxing", {})
+        if ("chaoxing" not in omitted and cx_outcome.get("auth_status") == "authenticated"
+                and not cx_outcome.get("deferred_reason") and auth_generations.get("chaoxing") == generation):
+            if (cx_outcome.get("coverage_complete") is not True and proof.get("auth_status") == "authenticated"
+                    and proof.get("auth_generation") == generation):
+                resolved = {item["source_key"] for item in
+                            [*result.get("candidates", []), *[update for update in result.get("status_updates", [])
+                                                           if update.get("status") == "completed"]]
+                            if item.get("source") == "chaoxing" and isinstance(item.get("source_key"), str)
+                            and re.fullmatch(r"course:\d+:class:\d+:work:\d+", item["source_key"])}
+                result["unresolved_homework"] = self.merge_unresolved_homework(
+                    previous_result.get("unresolved_homework", []), result.get("unresolved_homework", []), resolved)
+            result["unresolved_homework_verification"] = {
+                "auth_status": "authenticated", "auth_generation": generation, "read_at": now_iso()}
+        elif ("chaoxing" in omitted or cx_outcome.get("auth_status") != "authenticated") and (
+                proof.get("auth_status") == "authenticated" and proof.get("auth_generation") == generation):
+            # A bounded read of the other platform or a temporary network
+            # failure must not erase the last observed unresolved assignments.
+            result["unresolved_homework"] = previous_result.get("unresolved_homework", [])
+            result["unresolved_homework_verification"] = proof
+        elif "chaoxing" in omitted:
+            result["unresolved_homework"] = previous_result.get("unresolved_homework", [])
+        else:
+            result["unresolved_homework"] = []
         self.store.set_value("last_collection_result", result)
         # Completed platform records remain available for matching/cancellation,
         # but are not presented as new arrangements that need reminders.
@@ -649,6 +767,8 @@ class Handler(BaseHTTPRequestHandler):
                                             explicit=result.get("authenticated") is True)
             elif self.command == "POST" and path == "/api/collection/scan":
                 result = self.app.scan(update_existing=True, import_new=True)
+            elif self.command == "POST" and path == "/api/collection/confirm-year":
+                result = self.app.confirm_homework_year(raw)
             elif self.command == "POST" and path == "/api/collection/inspect":
                 result = self.app.collector.request("inspect")
             if result is None:

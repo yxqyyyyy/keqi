@@ -529,6 +529,7 @@ class BrowserCollector:
                             exam_courses=None if "chaoxing_exams" in all_course_types else course_scope.get("chaoxing_exams", chaoxing_adapter.EXAM_COURSES),
                             homework_year=options.get("homework_year"))
                         status_updates.extend(result.get("status_updates", []))
+                        unresolved_homework = result.get("unresolved_homework", [])
                         diagnostics["chaoxing"] = result.get("diagnostics", {})
                         auth = result["auth"]
                         source_statuses["chaoxing"] = {"status": auth["status"], "message": auth["message"]}
@@ -645,6 +646,7 @@ class BrowserCollector:
                         target.chmod(0o600)
                         complete = _coverage_complete(diagnostics, verified_chaoxing, verified_xiji)
                         reply = {"candidates": candidates, "warnings": list(dict.fromkeys(warnings)), "status_updates": status_updates,
+                                 "unresolved_homework": unresolved_homework if "chaoxing" not in conflicted else [],
                                  "coverage_complete": complete,
                                  "source_results": source_results,
                                  "homework_year_binding": diagnostics.get("chaoxing", {}).get("homework_year_binding")}

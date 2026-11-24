@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 
+from .core import homework_year_bindings
+
 FIELDS = {"chaoxing": ("chaoxing_homework", "chaoxing_exams"), "xiji": ("xiji",)}
 
 
@@ -18,6 +20,9 @@ def sync_signature(collection, source=None):
         value["all_course_types"] = active_all
     if source != "xiji":
         value["homework_year"] = collection.get("homework_year")
+        bindings = homework_year_bindings(collection)
+        if bindings:
+            value["homework_year_bindings"] = bindings
     return json.dumps(value, sort_keys=True, ensure_ascii=True)
 
 

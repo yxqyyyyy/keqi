@@ -135,6 +135,22 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(result["candidates"], [])
             self.assertEqual(len(context.request.calls), 1)
 
+    def test_verification_redirect_stops_all_course_reads_without_following_challenge(self):
+        context = CourseDirectoryContext({"1": course_card("11", "概率论") + course_card("12", "大学英语")})
+        get = context.request.get
+        def verification(url, **kwargs):
+            if urlparse(url).path == "/visit/stucoursemiddle":
+                context.request.calls.append((url, kwargs))
+                return Response(status=302, headers={"location": "https://mooc1.chaoxing.com/antispiderShowVerify.ac"})
+            return get(url, **kwargs)
+        context.request.get = verification
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        self.assertEqual(result["auth"]["status"], "verification_required")
+        self.assertEqual(result["diagnostics"]["coverage"]["courses_attempted"], 1)
+        self.assertFalse(result["diagnostics"]["coverage"]["complete"])
+        self.assertFalse(any("antispiderShowVerify.ac" in url for url, _ in context.request.calls))
+        self.assertEqual(sum(urlparse(url).path == "/visit/stucoursemiddle" for url, _ in context.request.calls), 1)
+
     def test_network_failure_does_not_leak_private_url(self):
         result = probe_chaoxing_auth(Context({"/base": RuntimeError("timeout https://secret.invalid/?token=PRIVATE")}))
         self.assertFalse(result["authenticated"])
@@ -339,6 +355,105 @@ class AdapterTests(unittest.TestCase):
                                        homework_year={**binding, "clazzid": "23"})
         self.assertEqual(wrong_class["candidates"], [])
         self.assertIsNone(wrong_class["diagnostics"]["homework_year_binding"])
+
+    def test_unconfirmed_other_course_work_remains_visible_for_date_review(self):
+        context = CourseDirectoryContext({"1": course_card("12", "英美现代戏剧原著赏读")},
+                                         dates="作答时间:11-13 15:18 至 11-26 15:19")
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        self.assertEqual(result["candidates"], [])
+        item, = result["unresolved_homework"]
+        self.assertEqual(item["course"], "英美现代戏剧原著赏读")
+        self.assertEqual(item["source_key"], "course:12:class:22:work:44")
+        self.assertEqual(item["time_text"], "作答时间:11-13 15:18 至 11-26 15:19")
+        self.assertEqual(item["reason"], "missing_year")
+        self.assertTrue(item["year_confirmation_available"])
+        self.assertEqual(item["status"], "pending")
+        self.assertEqual(result["diagnostics"]["unresolved_homework"], [item])
+
+    def test_multiple_confirmed_course_years_do_not_apply_to_unbound_courses(self):
+        cards = ''.join(course_card(value, name) for value, name in
+                        (("11", "概率论"), ("12", "大学英语"), ("13", "旧课程")))
+        bindings = [{"year": 2026, "courseid": "11", "clazzid": "22"},
+                    {"year": 2026, "courseid": "12", "clazzid": "22"},
+                    {"year": 2026, "courseid": "13", "clazzid": "999"}]
+        context = CourseDirectoryContext({"1": cards}, dates="作答时间:11-13 15:18 至 11-26 15:19")
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[], homework_year=bindings)
+        self.assertEqual([item["course"] for item in result["candidates"]], ["概率论", "大学英语"])
+        self.assertTrue(all(item["due_at"] == "2026-11-26T15:19:00+08:00" for item in result["candidates"]))
+        self.assertEqual([item["course"] for item in result["unresolved_homework"]], ["旧课程"])
+        self.assertEqual(result["diagnostics"]["homework_year_bindings"], bindings[:2])
+
+    def test_conflicting_course_year_bindings_remain_unresolved(self):
+        context = CourseDirectoryContext({"1": course_card("12", "英语")},
+                                         dates="作答时间:11-13 15:18 至 11-26 15:19")
+        bindings = [{"year": year, "courseid": "12", "clazzid": "22"} for year in (2025, 2026)]
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[], homework_year=bindings)
+        self.assertEqual(result["candidates"], [])
+        self.assertEqual(len(result["unresolved_homework"]), 1)
+        self.assertEqual(result["diagnostics"]["homework_year_bindings"], [])
+
+    def test_unresolved_absolute_conflicts_never_offer_year_confirmation(self):
+        variants = [
+            '<p>作答时间:11-13 15:18 至 11-26 15:19</p><input name="endTime" value="2026-11-27 15:19">',
+            '<p>作答时间:11-13 15:18 至 11-26 15:19</p><script>var workEndTime="2026-11-27 15:19";</script>',
+            '<p>作答时间:11-13 15:18 至 11-26 15:19</p><p>作答时间:11-14 15:18 至 11-27 15:19</p>',
+            '<p>作答时间:11-13 15:18 至 02-30 15:19</p>',
+        ]
+        for detail in variants:
+            with self.subTest(detail=detail):
+                context = Context({"/mooc-ans/mooc2/work/task": Response(detail)})
+                result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+                self.assertEqual(result["candidates"], [])
+                item, = result["unresolved_homework"]
+                self.assertFalse(item["year_confirmation_available"])
+                self.assertEqual(item["reason"], "unknown_deadline_or_conflict")
+
+    def test_absolute_list_conflict_cannot_be_replaced_by_yearless_detail(self):
+        row = ('<li onclick="goTask(this)" data="https://mooc1.chaoxing.com/mooc2/work/task?courseId=11&amp;classId=22&amp;workId=44">'
+               '<p class="overHidden2">英语作业</p><p class="status">未提交</p>'
+               '<p>截止时间:2026-11-26 15:19</p><input id="endTime" value="2026-11-27 15:19"></li>')
+        context = Context({"/mooc2/work/list": Response(row),
+                           "/mooc2/work/task": Response('<p>作答时间:11-13 15:18 至 11-26 15:19</p>')})
+        result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+        self.assertEqual(result["candidates"], [])
+        self.assertFalse(result["unresolved_homework"][0]["year_confirmation_available"])
+
+    def test_ambiguous_work_identity_never_offers_year_confirmation(self):
+        for query in ('courseId=11&amp;classId=22&amp;workId=44&amp;workId=55',
+                      'courseId=11&amp;courseId=99&amp;classId=22&amp;workId=44'):
+            with self.subTest(query=query):
+                row = ('<li onclick="goTask(this)" data="https://mooc1.chaoxing.com/mooc2/work/task?' + query + '">'
+                       '<p class="overHidden2">英语作业</p><p class="status">未提交</p>'
+                       '<p>作答时间:11-13 15:18 至 11-26 15:19</p></li>')
+                result = collect_chaoxing(Context({"/mooc2/work/list": Response(row)}),
+                                         homework_courses=None, exam_courses=[])
+                self.assertEqual(result["candidates"], [])
+                item, = result["unresolved_homework"]
+                self.assertEqual(item["source_key"], "")
+                self.assertFalse(item["year_confirmation_available"])
+
+    def test_completed_work_does_not_appear_in_unresolved_homework(self):
+        row = ('<li onclick="goTask(this)" data="https://mooc1.chaoxing.com/mooc2/work/task?courseId=11&amp;classId=22&amp;workId=44">'
+               '<p class="overHidden2">英语作业</p><p class="status">已完成</p></li>')
+        result = collect_chaoxing(Context({"/mooc2/work/list": Response(row)}), homework_courses=None, exam_courses=[])
+        self.assertEqual(result["unresolved_homework"], [])
+        self.assertEqual(result["status_updates"][0]["status"], "completed")
+
+    def test_duplicate_completed_evidence_removes_unresolved_but_conflicts_require_review(self):
+        def row(status):
+            return ('<li onclick="goTask(this)" data="https://mooc1.chaoxing.com/mooc2/work/task?courseId=11&amp;classId=22&amp;workId=44">'
+                    '<p class="overHidden2">英语作业</p><p class="status">' + status + '</p></li>')
+        detail = Response('<p>作答时间:11-13 15:18 至 11-26 15:19</p>')
+        for other, count in (("已互评", 0), ("未交", 1)):
+            with self.subTest(status=other):
+                context = Context({"/mooc2/work/list": Response(row(other) + row("已完成")),
+                                   "/mooc2/work/task": detail})
+                result = collect_chaoxing(context, homework_courses=None, exam_courses=[])
+                self.assertEqual(len(result["unresolved_homework"]), count)
+                if count:
+                    self.assertEqual(result["unresolved_homework"][0]["reason"], "status_conflict")
+                    self.assertEqual(result["unresolved_homework"][0]["status"], "unknown")
+                    self.assertFalse(result["unresolved_homework"][0]["year_confirmation_available"])
 
     def test_all_courses_follows_only_offered_course_directory_pages(self):
         first = course_card("11", "概率论") + '<a href="/mooc2-ans/visit/courselistdata?pageNum=2">下一页</a>'

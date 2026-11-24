@@ -108,6 +108,26 @@ class BackgroundRetryTests(unittest.TestCase):
         self.assertEqual(len(self.scans()), 3)
         self.assertEqual(self.scans()[-1].args[1]["course_scope"]["xiji"], ["离散数学"])
 
+    def test_verification_challenge_pauses_platform_until_explicit_user_repair(self):
+        result = outcome(xiji=True)
+        result['source_results']['chaoxing']['auth_status'] = 'verification_required'
+        self.app.collector.request.return_value = result
+        for when in (self.now, self.now + timedelta(minutes=5), self.now + timedelta(minutes=35),
+                     self.now + timedelta(days=1)):
+            self.app.automatic_collection(when)
+        self.assertEqual(len(self.scans()), 2)
+        self.assertEqual(self.scans()[1].args[1]['course_scope']['chaoxing_homework'], [])
+        self.assertEqual(self.app.store.get_value('collection_retry')['blocked_sources']['chaoxing']['reason'],
+                         'verification_required')
+        # A positive base-space probe alone cannot clear a work-page challenge.
+        self.app.refresh_auth_retry('chaoxing', 'authenticated')
+        self.assertIn('chaoxing', self.app.store.get_value('collection_retry')['blocked_sources'])
+        self.app.refresh_auth_retry('chaoxing', 'authenticated', explicit=True)
+        self.assertNotIn('chaoxing', self.app.store.get_value('collection_retry')['blocked_sources'])
+        self.app.automatic_collection(self.now + timedelta(days=1, minutes=1))
+        self.assertEqual(len(self.scans()), 3)
+        self.assertEqual(self.scans()[-1].args[1]['course_scope']['chaoxing_homework'], ['概率论'])
+
     def test_unverified_layout_does_not_become_login_required(self):
         self.app.collector.request.return_value = outcome(xiji_auth="unverified")
         self.app.automatic_collection(self.now)

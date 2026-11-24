@@ -194,6 +194,10 @@ class _LoginRequired(_ReadError):
     pass
 
 
+class _VerificationRequired(_ReadError):
+    pass
+
+
 class _Reader:
     def __init__(self, context, budget=65, max_requests=100):
         self.context = context
@@ -232,6 +236,8 @@ class _Reader:
             if 300 <= status < 400:
                 target = urljoin(url, response.headers.get("location", ""))
                 event["redirect"] = _route(target)
+                if urlparse(target).path == "/antispiderShowVerify.ac":
+                    raise _VerificationRequired("学习通要求本人完成验证码验证，已停止本次读取；已有安排会保留，请在平台完成验证后检查状态")
                 if "passport" in (urlparse(target).hostname or "") or "/login" in urlparse(target).path.lower():
                     raise _LoginRequired("学习通登录已失效，请在专用浏览器中本人重新登录")
                 url = target
@@ -277,6 +283,8 @@ def probe_chaoxing_auth(context):
         return result
     except _LoginRequired as exc:
         return {"authenticated": False, "status": "not_authenticated", "message": str(exc), "signals": []}
+    except _VerificationRequired as exc:
+        return {"authenticated": False, "status": "verification_required", "message": str(exc), "signals": []}
     except Exception as exc:
         return {"authenticated": False, "status": "error", "message": str(exc) if isinstance(exc, _ReadError) else "登录状态检查失败，请重试", "signals": []}
 
@@ -410,7 +418,7 @@ def _course_directory(reader, fid):
             break
         try:
             _, tree = reader.get(COURSES, {**base, **page})
-        except _LoginRequired:
+        except (_LoginRequired, _VerificationRequired):
             raise
         except _ReadError as exc:
             complete = False
@@ -615,12 +623,16 @@ def _work_rows(tree, homework_year=None):
         title_node = next((child for child in node.walk() if child.has_class("overHidden2")), None)
         status_node = next((child for child in node.walk() if child.has_class("status")), None)
         due, start = _dates(node)
+        time_evidence = _work_time_evidence("", node)
         confirmed_text = None
-        if not due and homework_year is not None:
+        if not due and homework_year is not None and not _work_has_absolute_time(time_evidence):
             due, start, confirmed_text = _confirmed_work_dates(node, homework_year)
         rows.append({"title": title_node.text() if title_node else "", "status": status_node.text() if status_node else "",
                      "url": unquote(html.unescape(node.attrs.get("data", ""))), "due_at": due, "start_at": start,
-                     "confirmed_year_text": confirmed_text})
+                     "confirmed_year_text": confirmed_text,
+                     "time_evidence": time_evidence,
+                     "has_absolute_time": _work_has_absolute_time(time_evidence),
+                     "year_confirmation_text": _work_year_confirmation_text(node)})
     return rows
 
 
@@ -670,6 +682,31 @@ def _work_time_evidence(source, tree):
         if len(scripts) >= 20:
             break
     return {"visible_time_fragments": list(dict.fromkeys(fragments))[:10], "time_inputs": inputs[:20], "script_time_fields": scripts}
+
+
+def _work_has_absolute_time(evidence):
+    return (any(DATE_RE.search(value) for value in evidence.get("visible_time_fragments", []))
+            or any(_datetime(item["value"]) for name in ("time_inputs", "script_time_fields")
+                   for item in evidence.get(name, [])))
+
+
+def _work_year_confirmation_text(tree, source=""):
+    # A leap year is only a syntax probe, never the year assigned to the task.
+    # Explicit dates in any supported metadata channel forbid filling a year.
+    if _work_has_absolute_time(_work_time_evidence(source, tree)):
+        return None
+    return _confirmed_work_dates(tree, 2000)[2]
+
+
+def _work_identity(url):
+    query = parse_qs(urlparse(url).query, keep_blank_values=True)
+    result = {}
+    for field in ("courseid", "classid", "workid"):
+        values = [value for name, entries in query.items() if name.lower() == field for value in entries]
+        if len(values) != 1 or not re.fullmatch(r"\d+", values[0]):
+            return None
+        result[field] = values[0]
+    return result
 
 
 def _candidate(title, course, kind, due, start, key, url, status, evidence):
@@ -946,6 +983,20 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
     exam_awaiting_review_list_navigation = []
     exam_status_options = []
     year_binding = None
+    year_bindings = []
+    unresolved_homework = []
+
+    def unresolved(course, row, key, reason, time_evidence=None, confirmation_text=None):
+        if _completion_status(row["status"]) == "completed":
+            return
+        fragments = (time_evidence or row.get("time_evidence", {})).get("visible_time_fragments", [])
+        unresolved_homework.append({
+            "course": course["name"], "title": row["title"][:300], "source": "chaoxing",
+            "source_key": key, "courseid": course["courseid"], "clazzid": course["clazzid"],
+            "status": _completion_status(row["status"]) or "unknown", "reason": reason,
+            "time_text": "；".join(fragments)[:1200],
+            "year_confirmation_available": bool(key and reason == "missing_year" and confirmation_text),
+        })
     all_courses = homework_courses is None or exam_courses is None
     reader = _Reader(context, budget=90, max_requests=200) if all_courses else _Reader(context)
     coverage = {"courses_found": 0, "courses_in_scope": 0, "courses_out_of_scope": 0, "courses_attempted": 0,
@@ -966,12 +1017,12 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
     if coverage["disabled"]:
         coverage["complete"] = True
         auth.update(status="disabled", message="未设置学习通课程，已跳过采集")
-        return {"candidates": [], "status_updates": [], "warnings": [], "auth": auth,
+        return {"candidates": [], "status_updates": [], "unresolved_homework": [], "warnings": [], "auth": auth,
                 "diagnostics": {**reader.diagnostics(), "coverage": coverage, "homework_year_binding": None}}
     try:
         auth, base_source, base_tree = _probe(reader)
         if not auth["authenticated"]:
-            return {"candidates": [], "status_updates": [], "warnings": [auth["message"]], "auth": auth,
+            return {"candidates": [], "status_updates": [], "unresolved_homework": [], "warnings": [auth["message"]], "auth": auth,
                     "diagnostics": {**reader.diagnostics(), "coverage": coverage, "unidentified_exam_rows": unidentified_exam_rows,
                                     "work_time_evidence": work_time_evidence, "work_status_evidence": work_status_evidence,
                                     "homework_year_binding": year_binding}}
@@ -1020,13 +1071,13 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                             evidence["list_filter"] = list_filter
                         if not coverage[prefix + "_list_recognized"]:
                             warnings.append(label + "考试列表结构未识别，已保留其他列表结果，请人工核对")
-                    except _LoginRequired:
+                    except (_LoginRequired, _VerificationRequired):
                         raise
                     except _ReadError as exc:
                         warnings.append(label + "考试列表：" + str(exc))
                     finally:
                         coverage["exam_list_recognized"] = default_recognized
-            except _LoginRequired:
+            except (_LoginRequired, _VerificationRequired):
                 raise
             except _ReadError as exc:
                 warnings.append(str(exc))
@@ -1052,7 +1103,22 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
             if coverage["homework_scope_missing"] and coverage["courses_found"]:
                 warnings.append("课程列表中未发现指定的学习通作业课程（" + "、".join(coverage["homework_scope_missing"]) + "），请核对课程名配置")
             if homework_year is not None:
-                if homework_courses is None:
+                if isinstance(homework_year, list):
+                    grouped = {}
+                    for config in homework_year:
+                        if not isinstance(config, dict):
+                            continue
+                        year = config.get("year")
+                        identity = (config.get("courseid"), config.get("clazzid"))
+                        if (isinstance(year, int) and not isinstance(year, bool) and 2000 <= year < 2100
+                                and any(identity == (course["courseid"], course["clazzid"]) for course in courses)):
+                            grouped.setdefault(identity, set()).add(year)
+                    for (courseid, clazzid), years in grouped.items():
+                        if len(years) == 1:
+                            year_bindings.append({"year": next(iter(years)), "courseid": courseid, "clazzid": clazzid})
+                        else:
+                            warnings.append("同一课程与班级的确认年份相互冲突，未补年份，请重新核对")
+                elif homework_courses is None:
                     config = homework_year if isinstance(homework_year, dict) else {}
                     year = config.get("year")
                     matches = [course for course in courses if config.get("courseid") == course["courseid"]
@@ -1074,14 +1140,17 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                         warnings.append("用户确认年份的课程绑定或年份值与当前课程不符，未补年份")
                 else:
                     warnings.append("用户确认的作业年份仅能绑定唯一课程；当前未能唯一匹配，未补年份")
+            if year_binding:
+                year_bindings.append(year_binding)
             for course in courses:
                 if time.monotonic() >= reader.deadline - 1 or reader.count >= reader.max_requests:
                     warnings.append("本次采集达到时间或请求数上限，结果可能不完整，请稍后重试")
                     break
                 coverage["courses_attempted"] += 1
                 prefix = course["name"][:60] + "："
-                confirmed_year = year_binding["year"] if year_binding and all(
-                    year_binding[key] == course[key] for key in ("courseid", "clazzid")) else None
+                binding = next((item for item in year_bindings if all(
+                    item[key] == course[key] for key in ("courseid", "clazzid"))), None)
+                confirmed_year = binding["year"] if binding else None
                 try:
                     params = {key: course[key] for key in ("courseid", "clazzid", "cpi")}
                     _, middle = reader.get(MIDDLE, {**params, "ismooc2": 1, "v": 2})
@@ -1106,15 +1175,17 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                     # later timeout must not hide submitted-work updates.
                     for row in rows:
                         url = urljoin(WORKS, row["url"])
-                        ids = _params(url)
+                        ids = _work_identity(url) or {}
                         work_id = ids.get("workid")
                         if not work_id or not re.fullmatch(r"\d+", work_id):
                             coverage["work_items_incomplete"] += 1
                             warnings.append(prefix + "有作业缺少真实 ID，已跳过")
+                            unresolved(course, row, "", "missing_id")
                             continue
                         if ids.get("courseid") != course["courseid"] or ids.get("classid") != course["clazzid"]:
                             coverage["work_items_incomplete"] += 1
                             warnings.append(prefix + "详情课程 ID 与列表不一致，已跳过")
+                            unresolved(course, row, "", "identity_mismatch")
                             continue
                         key = "course:" + course["courseid"] + ":class:" + course["clazzid"] + ":work:" + work_id
                         completion = _completion_status(row["status"])
@@ -1132,6 +1203,7 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                         if not row["title"] or not _safe_url(url) or urlparse(url).path not in WORK_TASK_PATHS:
                             coverage["work_items_incomplete"] += 1
                             warnings.append(prefix + "有作业缺少只读详情链接，已跳过日期读取")
+                            unresolved(course, row, key, "missing_detail_link")
                             continue
                         pending_rows.append((row, url, key))
                     for row, url, key in pending_rows[:80]:
@@ -1139,17 +1211,28 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                         # list. Open the homework detail only when necessary.
                         due, start = row["due_at"], row["start_at"]
                         confirmed_text = row["confirmed_year_text"]
+                        time_evidence = row["time_evidence"]
+                        confirmation_text = row["year_confirmation_text"]
                         if not due:
-                            detail_source, detail = reader.get(url)
+                            try:
+                                detail_source, detail = reader.get(url)
+                            except _ReadError:
+                                unresolved(course, row, key, "read_failed")
+                                raise
                             coverage["work_details_read"] += 1
+                            time_evidence = _work_time_evidence(detail_source, detail)
+                            confirmation_text = (None if row["has_absolute_time"] else
+                                                 _work_year_confirmation_text(detail, detail_source))
                             if len(work_time_evidence) < 20:
-                                work_time_evidence.append({"title": row["title"][:120], **_work_time_evidence(detail_source, detail)})
+                                work_time_evidence.append({"title": row["title"][:120], **time_evidence})
                             due, start = _dates(detail)
-                            if not due and confirmed_year is not None:
+                            if not due and confirmed_year is not None and confirmation_text:
                                 due, start, confirmed_text = _confirmed_work_dates(detail, confirmed_year)
                         if not due:
                             coverage["work_items_incomplete"] += 1
                             warnings.append(prefix + row["title"][:50] + "的截止时间缺少年份、未知或存在冲突；需手动核对，未猜测年份")
+                            unresolved(course, row, key, "missing_year" if confirmation_text else "unknown_deadline_or_conflict",
+                                       time_evidence, confirmation_text)
                             continue
                         # Link back to the course; do not persist expiring enc/signature values.
                         public_link = MIDDLE + "?" + urlencode(params)
@@ -1162,13 +1245,18 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                     if len(pending_rows) > 80:
                         coverage["work_items_incomplete"] += len(pending_rows) - 80
                         warnings.append(prefix + "未完成作业超过 80 项，本次仅截断日期详情读取，所有已识别列表状态均已检查")
+                        for row, _, key in pending_rows[80:]:
+                            unresolved(course, row, key, "read_limit")
                     coverage["courses_completed"] += 1
-                except _LoginRequired:
+                except (_LoginRequired, _VerificationRequired):
                     raise
                 except _ReadError as exc:
                     warnings.append(prefix + str(exc))
                     if time.monotonic() >= reader.deadline - 1 or reader.count >= reader.max_requests:
                         break
+    except _VerificationRequired as exc:
+        auth = {**auth, "status": "verification_required", "message": str(exc)}
+        warnings.append(str(exc))
     except _LoginRequired as exc:
         auth = {"authenticated": False, "status": "not_authenticated", "message": str(exc), "signals": []}
         warnings.append(str(exc))
@@ -1201,6 +1289,21 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
         unique_updates[key] = update
     if conflicting_updates:
         warnings.append("部分作业或考试的列表信息互相冲突，未自动更新完成状态，请本人核对")
+    unresolved_by_identity = {}
+    for item in unresolved_homework:
+        key = item["source_key"]
+        update = unique_updates.get(key, {})
+        if key in conflicting_updates:
+            item = {**item, "status": "unknown", "reason": "status_conflict", "year_confirmation_available": False}
+        elif update.get("status") == "completed":
+            continue
+        identity = key or (item["courseid"], item["clazzid"], item["title"], item["time_text"], item["reason"])
+        previous = unresolved_by_identity.get(identity)
+        if previous and previous["time_text"] != item["time_text"]:
+            item = {**item, "reason": "time_conflict", "year_confirmation_available": False,
+                    "time_text": (previous["time_text"] + "；" + item["time_text"])[:1200]}
+        unresolved_by_identity[identity] = item
+    unresolved_homework = list(unresolved_by_identity.values())
     unique = {item["source_key"]: item for item in candidates if item["source_key"] not in conflicting_updates}
     # Only a complete metadata/status read may satisfy the daily schedule.
     # Confirmed submissions need no deadline to cancel an existing reminder.
@@ -1218,6 +1321,7 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
             coverage["exam_awaiting_review_lists_read"] == 1 and coverage["exam_awaiting_review_list_recognized"])))
     coverage["complete"] = bool(auth["authenticated"] and homework_complete and exams_complete and not conflicting_updates)
     return {"candidates": list(unique.values()), "status_updates": [item for key, item in unique_updates.items() if key not in conflicting_updates],
+            "unresolved_homework": unresolved_homework,
             "warnings": list(dict.fromkeys(warnings)), "auth": auth,
             "diagnostics": {**reader.diagnostics(), "coverage": coverage, "unidentified_exam_rows": unidentified_exam_rows,
                             "work_time_evidence": work_time_evidence, "work_status_evidence": work_status_evidence,
@@ -1226,4 +1330,5 @@ def collect_chaoxing(context, homework_courses=HOMEWORK_COURSES, exam_courses=EX
                             "exam_completed_list_navigation": exam_completed_list_navigation,
                             "exam_awaiting_review_list_navigation": exam_awaiting_review_list_navigation,
                             "exam_status_options": exam_status_options,
-                            "homework_year_binding": year_binding}}
+                            "homework_year_binding": year_binding, "homework_year_bindings": year_bindings,
+                            "unresolved_homework": unresolved_homework}}

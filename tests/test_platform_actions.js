@@ -22,7 +22,7 @@ const sandbox = {
   escapeHTML: value => String(value),
 };
 vm.createContext(sandbox);
-vm.runInContext('const pendingPlatformActions = new Map();\n' +
+vm.runInContext('const pendingPlatformActions = new Map(); const pendingYearConfirmations = new Set();\n' +
   section('function renderPlatforms()', 'function renderSettings()') +
   section('async function platformAction(', 'async function connectPlatform('), sandbox);
 const html = () => elements.get('#platformList').innerHTML;
@@ -49,6 +49,13 @@ const card = name => html().split('<article class="platform-card">').find(value 
   assert(card('xiji').includes('验证未完成'));
   assert(card('xiji').includes('尚不能判断会话是否有效'));
   assert(!card('xiji').includes('登录已失效'));
+  sandbox.state.platforms.chaoxing = {status: 'verification_required'};
+  sandbox.state.collection.automatic_retry = {blocked_sources: {chaoxing: {reason: 'verification_required'}}};
+  sandbox.renderPlatforms();
+  assert(card('chaoxing').includes('需要本人完成平台验证'));
+  assert(!card('chaoxing').includes('登录已失效'));
+  assert(elements.get('#collectionModeMessage').textContent.includes('平台要求验证码，自动读取已暂停'));
+  assert(!elements.get('#collectionModeMessage').textContent.includes('登录已失效'));
   console.log('Platform action refresh, duplicate-click, failure recovery and unknown-login checks passed');
 })().catch(error => {console.error(error); process.exitCode = 1;});
 
@@ -206,6 +213,94 @@ console.log('Desktop phone-update polling and focus refresh checks passed');
   assert.equal(latestState.state.tasks[0].status, 'completed');
   assert.equal(rendered, 1, 'an older response cannot restore stale phone state');
   console.log('Concurrent desktop reads preserve the latest phone state');
+})().catch(error => { console.error(error); process.exitCode = 1; });
+
+// A discovered assignment without a deadline stays visible even with no import candidates.
+(async () => {
+  const controls = new Map();
+  const input = { value: '2026' }, button = { disabled: false, textContent: '确认年份并加入安排' }, errorBox = {};
+  const form = { dataset: { courseid: '11', clazzid: '22' } };
+  const homework = { course: '英美现代戏剧原著赏读', title: '<img src=x onerror=alert(1)>', source_key: 'course:11:class:22:work:44',
+    courseid: '11', clazzid: '22', time_text: '作答时间:11-13 15:18 至 11-26 15:19',
+    status: 'pending', reason: 'missing_year', year_confirmation_available: true };
+  let posted, syncs = 0, refreshes = 0, requests = 0, fail = false, release, needsScan = true, message;
+  const ui = {
+    state: { collection: { candidates: [], unresolved_homework: [homework] } },
+    document: { activeElement: null },
+    beijingDay: () => '2026-11-24',
+    $: (selector, root) => {
+      if (root === form) return selector === 'input[name="year"]' ? input : selector === '.form-error' ? errorBox : button;
+      if (!controls.has(selector)) controls.set(selector, { contains: element => element === input });
+      return controls.get(selector);
+    },
+    busy: async (target, _label, action) => { target.disabled = true; try { return await action(); } finally { target.disabled = false; } },
+    api: async (url, options) => {
+      requests++;
+      assert.equal(url, '/api/collection/confirm-year');
+      posted = JSON.parse(options.body);
+      if (fail) throw Error('年份确认失败');
+      if (release !== undefined) await new Promise(resolve => { release = resolve; });
+      return { needs_scan: needsScan, message: needsScan ? undefined : '已加入 1 项安排，日历已更新。' };
+    },
+    syncCollection: async () => { syncs++; },
+    refresh: async options => { assert.equal(options.silent, true); refreshes++; return true; },
+    toast: value => { message = value; },
+  };
+  vm.createContext(ui);
+  vm.runInContext('const pendingYearConfirmations = new Set();\n' +
+    section('function escapeHTML(', 'function beijingDay(') +
+    section('function unresolvedHomework()', 'function renderSettings()'), ui);
+  ui.renderUnresolvedHomework();
+  const list = controls.get('#unresolvedList');
+  assert.equal(controls.get('#unresolvedArea').hidden, false);
+  assert.equal(controls.get('#unresolvedNudge').hidden, false);
+  assert(controls.get('#unresolvedSummary').textContent.includes('1 项'));
+  assert(list.innerHTML.includes('英美现代戏剧原著赏读'));
+  assert(list.innerHTML.includes('11-26 15:19'));
+  assert(list.innerHTML.includes('&lt;img'));
+  assert(!list.innerHTML.includes('<img'));
+  assert(list.innerHTML.includes('value="2026"'));
+  assert(list.innerHTML.includes('确认年份并加入安排'));
+  list.innerHTML = 'editing';
+  ui.document.activeElement = input;
+  ui.renderUnresolvedHomework();
+  assert.equal(list.innerHTML, 'editing', 'periodic refresh must preserve a year being edited');
+  ui.document.activeElement = null;
+  ui.state.collection.unresolved_homework = [{ ...homework, reason: 'missing_id', year_confirmation_available: false }];
+  ui.renderUnresolvedHomework();
+  assert(!list.innerHTML.includes('confirm-year-form'), 'an unidentified assignment cannot establish a year binding');
+  ui.state.collection.unresolved_homework = [homework];
+  input.value = '2026.5';
+  await ui.confirmHomeworkYear(form);
+  assert.equal(requests, 0);
+  assert(errorBox.textContent.includes('2000 至 2099'));
+  input.value = '2026'; fail = true;
+  await ui.confirmHomeworkYear(form);
+  assert.equal(errorBox.textContent, '年份确认失败');
+  assert.equal(syncs, 0, 'failed confirmation must not start a collection');
+  fail = false; release = () => {};
+  const first = ui.confirmHomeworkYear(form);
+  await ui.confirmHomeworkYear(form);
+  assert.equal(requests, 2, 'double-click must not duplicate confirmation');
+  release(); await first;
+  assert.deepEqual(posted, { courseid: '11', clazzid: '22', year: 2026 });
+  assert.equal(syncs, 1, 'confirmed year must be followed by the normal scan');
+  assert.equal(refreshes, 0, 'a requested scan handles its own refresh');
+  assert.equal(button.disabled, false);
+  release = undefined; needsScan = false;
+  await ui.confirmHomeworkYear(form);
+  assert.equal(syncs, 1, 'a direct import must not trigger a second platform scan');
+  assert.equal(refreshes, 1, 'a direct import must refresh the saved arrangements');
+  assert.equal(message, '已加入 1 项安排，日历已更新。');
+  ui.state.collection.unresolved_homework = [];
+  ui.renderUnresolvedHomework();
+  assert.equal(controls.get('#unresolvedArea').hidden, true);
+  assert.equal(controls.get('#unresolvedNudge').hidden, true);
+  assert.equal(list.innerHTML, '');
+  ui.state = {};
+  ui.renderUnresolvedHomework();
+  assert.equal(controls.get('#unresolvedArea').hidden, true, 'older state without collection remains compatible');
+  console.log('Unresolved homework visibility, safe year confirmation and input preservation checks passed');
 })().catch(error => { console.error(error); process.exitCode = 1; });
 
 // Exercise the settings form through its real submit handler, including all-only categories.
